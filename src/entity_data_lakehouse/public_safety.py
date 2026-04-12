@@ -30,7 +30,14 @@ def scan_public_safety(repo_root: Path) -> list[str]:
             continue
         if any(
             part
-            in {".ruff_cache", ".pytest_cache", "__pycache__", ".venv", "node_modules"}
+            in {
+                ".ruff_cache",
+                ".pytest_cache",
+                "__pycache__",
+                ".venv",
+                "node_modules",
+                ".opencode",
+            }
             for part in path.parts
         ):
             continue

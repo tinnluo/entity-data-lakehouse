@@ -6,3 +6,4 @@ __pycache__/
 bronze/
 silver/
 gold/
+.opencode/
