@@ -177,6 +177,32 @@ The DAG `entity_lakehouse_pipeline` runs three tasks in sequence:
 Uses `SequentialExecutor` + SQLite (Airflow 2.9 recommended dev configuration).
 See [airflow/README.md](airflow/README.md) and [docs/architecture.md](docs/architecture.md) for details.
 
+## LoRA Fine-Tuning Demo
+
+An optional LoRA-tuned LLM path overrides the `predicted_lifecycle_stage` column when
+`ML_BACKEND=lora` is set.  All other predictions (retirement year, capacity factor) always
+use scikit-learn, so integration-test row counts are unchanged.
+
+**Hardware:** MPS (Apple Silicon) or CUDA recommended; CPU is slow but functional.
+
+```bash
+pip install -e '.[lora]'
+
+# Train adapter on synthetic data (≈5 min on MPS):
+python scripts/train_lora.py --samples 200 --epochs 1
+
+# Evaluate LoRA vs sklearn baseline:
+python scripts/eval_lora.py
+
+# Run pipeline with LoRA lifecycle stage:
+ML_BACKEND=lora python scripts/run_pipeline.py
+
+# Default (ML_BACKEND unset) — identical to baseline, ml_lora never imported:
+python scripts/run_pipeline.py
+```
+
+See [docs/architecture.md](docs/architecture.md) for the full design rationale.
+
 ## Public-Safety Guarantees
 
 - This repository is a public-safe demo distilled from a production project.

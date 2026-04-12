@@ -95,3 +95,45 @@ make airflow-up
 ```
 
 See `airflow/README.md` for detailed local dev instructions.
+
+## LoRA Fine-Tuning Demo
+
+`ML_BACKEND=lora` activates an optional LoRA-tuned LLM path for the
+`predicted_lifecycle_stage` column only.  All other prediction columns
+(estimated_retirement_year, predicted_capacity_factor_pct, etc.) continue
+using the scikit-learn models unchanged.
+
+### Design
+
+| Component | Description |
+|---|---|
+| `src/entity_data_lakehouse/ml_lora.py` | Lazy-import module: prompt construction, JSONL generation, adapter training, inference |
+| `scripts/train_lora.py` | CLI to generate synthetic JSONL + fine-tune the adapter |
+| `scripts/eval_lora.py` | Accuracy / F1 / confusion matrix: LoRA vs sklearn baseline |
+| `models/lifecycle_lora_adapter/` | Saved PEFT adapter weights (gitignored) |
+
+Base model: `Qwen/Qwen2.5-0.5B-Instruct`
+
+### Adapter path resolution
+
+The adapter directory is resolved from `gold_root.parent / "models" / "lifecycle_lora_adapter"`,
+or overridden via `LORA_ADAPTER_PATH`.  CWD-relative paths are never used.
+
+### Usage
+
+```bash
+pip install -e '.[lora]'
+
+# 1. Train the adapter (~5 min on MPS / GPU):
+python scripts/train_lora.py --samples 200 --epochs 1
+
+# 2. Optional: evaluate vs sklearn baseline:
+python scripts/eval_lora.py
+
+# 3. Run pipeline with LoRA lifecycle stage:
+ML_BACKEND=lora python scripts/run_pipeline.py
+```
+
+When `ML_BACKEND` is unset (default), `ml_lora` is never imported and behaviour
+is identical to the pre-LoRA baseline.  Integration-test row counts are not
+affected: `ml=5` holds regardless of backend.

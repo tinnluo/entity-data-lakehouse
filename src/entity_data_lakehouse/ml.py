@@ -670,6 +670,50 @@ def build_ml_predictions(
         else {},
     )
 
+    # --- 5a. Optional LoRA lifecycle-stage override ---
+    # When ML_BACKEND=lora is set and a trained adapter exists, override only
+    # predicted_lifecycle_stage and lifecycle_stage_confidence.  All other
+    # columns (retirement year, capacity factor, commissioning year, etc.)
+    # remain unchanged so the contract and integration-test row counts are
+    # not affected.
+    import os as _os
+
+    _backend = _os.environ.get("ML_BACKEND")
+    if _backend == "lora":
+        _default_adapter = gold_root.parent / "models" / "lifecycle_lora_adapter"
+        _adapter_dir = Path(_os.environ.get("LORA_ADAPTER_PATH", str(_default_adapter)))
+        if _adapter_dir.exists():
+            from entity_data_lakehouse.ml_lora import predict_lifecycle_lora
+
+            if len(enriched) != len(predictions):
+                raise ValueError(
+                    f"LoRA override row mismatch: enriched={len(enriched)} "
+                    f"vs predictions={len(predictions)}"
+                )
+            logger.info(
+                "ML_BACKEND=lora: overriding lifecycle stage column for %d assets "
+                "using adapter at %s.",
+                len(predictions),
+                _adapter_dir,
+            )
+            for i, (_, feat_row) in enumerate(enriched.iterrows()):
+                stage, conf = predict_lifecycle_lora(
+                    feat_row.to_dict(), adapter_dir=_adapter_dir
+                )
+                predictions.iat[
+                    i, predictions.columns.get_loc("predicted_lifecycle_stage")
+                ] = stage
+                predictions.iat[
+                    i, predictions.columns.get_loc("lifecycle_stage_confidence")
+                ] = conf
+            predictions["model_version"] = predictions["model_version"] + "+lora"
+        else:
+            logger.warning(
+                "ML_BACKEND=lora set but adapter not found at %s; "
+                "falling back to sklearn predictions.",
+                _adapter_dir,
+            )
+
     # --- 6. Validate against contract ---
     validate_dataframe(predictions, contract_paths["asset_lifecycle_predictions"])
 
