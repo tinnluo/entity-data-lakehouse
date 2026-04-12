@@ -1,0 +1,19 @@
+version: 2
+
+models:
+  - name: entity_master_current
+    description: "Pass-through of dw_entity_master_current into the analytics schema."
+    columns:
+      - name: entity_id
+        description: "Unique entity identifier."
+        tests:
+          - unique
+          - not_null
+      - name: entity_name
+        description: "Human-readable entity name."
+        tests:
+          - not_null
+      - name: country_code
+        description: "ISO country code."
+        tests:
+          - not_null

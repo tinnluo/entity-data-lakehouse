@@ -1,0 +1,8 @@
+entity_data_lakehouse:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: ../gold/entity_lakehouse.duckdb
+      schema: main
+      threads: 1

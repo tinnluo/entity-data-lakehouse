@@ -68,3 +68,35 @@ Changes in ownership percentage or asset-facing business attributes create a new
 ## Derived Mart
 
 The existing public output, `owner_infrastructure_exposure_snapshot`, is retained as a derived mart. It is rebuilt from the SCD2 history table using as-of logic for every snapshot date present in the SCD4 pipeline.
+
+## dbt Modelling Layer
+
+A dbt-duckdb project (`dbt/`) sits above the gold DuckDB and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
+
+### Schema layout
+
+| dbt model | Source table (main.*) | Target (main_analytics.*) |
+|---|---|---|
+| `entity_master_current` | `dw_entity_master_current` | `main_analytics.entity_master_current` |
+| `ownership_current` | `dw_ownership_current` | `main_analytics.ownership_current` |
+| `owner_infrastructure_exposure_snapshot` | `mart_owner_infrastructure_exposure_snapshot` | `main_analytics.owner_infrastructure_exposure_snapshot` |
+| `asset_lifecycle_predictions` | `ml_asset_lifecycle_predictions` | `main_analytics.asset_lifecycle_predictions` |
+
+### Data-quality tests
+
+Schema tests (defined in `dbt/models/gold/*.yml`) assert uniqueness and non-null constraints on grain keys and required columns.
+
+Singular tests (in `dbt/tests/`) assert:
+
+- `assert_ownership_current_unique_grain.sql` — no two current rows share the same `business_key_hash`
+- `assert_owner_exposure_grain.sql` — `(snapshot_date, owner_entity_id, asset_country, asset_sector)` is unique
+- `assert_owner_exposure_nonneg_capacity.sql` — `owned_capacity_mw >= 0` and `0 <= average_ownership_pct <= 100`
+
+### Running
+
+```bash
+pip install -e '.[dbt]'
+cd dbt && dbt run --profiles-dir . && dbt test --profiles-dir .
+```
+
+Or via `make dbt-run` and `make dbt-test` from the repo root.

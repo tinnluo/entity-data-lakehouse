@@ -1,0 +1,19 @@
+select
+    ownership_sk,
+    business_key_hash,
+    owner_entity_id,
+    owner_entity_name,
+    asset_id,
+    asset_name,
+    asset_country,
+    asset_sector,
+    capacity_mw,
+    ownership_pct,
+    observation_source,
+    effective_date,
+    expiry_date,
+    is_current_flag,
+    version_number,
+    change_reason,
+    dw_batch_id
+from {{ source('lakehouse', 'dw_ownership_current') }}

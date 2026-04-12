@@ -1,0 +1,18 @@
+version: 2
+
+models:
+  - name: owner_infrastructure_exposure_snapshot
+    description: "Pass-through of mart_owner_infrastructure_exposure_snapshot into the analytics schema."
+    columns:
+      - name: owner_entity_id
+        description: "Owner entity identifier."
+        tests:
+          - not_null
+      - name: snapshot_date
+        description: "Date of the snapshot."
+        tests:
+          - not_null
+      - name: owned_capacity_mw
+        description: "Total owned capacity in megawatts."
+        tests:
+          - not_null

@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: ownership_current
+    description: "Pass-through of dw_ownership_current (SCD2 current rows) into the analytics schema."
+    columns:
+      - name: ownership_sk
+        description: "Unique surrogate key for ownership record."
+        tests:
+          - unique
+          - not_null
+      - name: owner_entity_id
+        description: "FK to entity_master_current."
+        tests:
+          - not_null
+      - name: asset_id
+        description: "Infrastructure asset identifier."
+        tests:
+          - not_null
+      - name: is_current_flag
+        description: "SCD2 currency flag. Y = current row, N = historical row."
+        tests:
+          - accepted_values:
+              values: ['Y', 'N']

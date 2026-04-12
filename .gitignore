@@ -7,3 +7,6 @@ bronze/
 silver/
 gold/
 .opencode/
+dbt/target/
+dbt/dbt_packages/
+dbt/logs/

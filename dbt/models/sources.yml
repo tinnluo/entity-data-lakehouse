@@ -1,0 +1,10 @@
+version: 2
+
+sources:
+  - name: lakehouse
+    schema: main
+    tables:
+      - name: dw_entity_master_current
+      - name: dw_ownership_current
+      - name: mart_owner_infrastructure_exposure_snapshot
+      - name: ml_asset_lifecycle_predictions

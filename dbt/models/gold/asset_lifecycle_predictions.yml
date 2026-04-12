@@ -1,0 +1,24 @@
+version: 2
+
+models:
+  - name: asset_lifecycle_predictions
+    description: "Pass-through of ml_asset_lifecycle_predictions into the analytics schema."
+    columns:
+      - name: asset_id
+        description: "Unique asset identifier."
+        tests:
+          - unique
+          - not_null
+      - name: predicted_lifecycle_stage
+        description: "ML-predicted lifecycle stage for the asset."
+        tests:
+          - accepted_values:
+              values: ['planning', 'construction', 'operating', 'decommissioning', 'retired']
+      - name: lifecycle_stage_confidence
+        description: "Confidence score for the predicted lifecycle stage (0–1)."
+        tests:
+          - not_null
+      - name: model_version
+        description: "Version string of the ML model that produced this prediction."
+        tests:
+          - not_null

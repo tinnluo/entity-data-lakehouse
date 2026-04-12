@@ -37,8 +37,17 @@ def scan_public_safety(repo_root: Path) -> list[str]:
                 ".venv",
                 "node_modules",
                 ".opencode",
+                "dbt_packages",
             }
             for part in path.parts
+        ):
+            continue
+        # Skip dbt-generated artefact directories (contain machine-written absolute paths).
+        if any(
+            len(path.parts) > i + 1
+            and path.parts[i] == "dbt"
+            and path.parts[i + 1] in {"target", "logs"}
+            for i in range(len(path.parts) - 1)
         ):
             continue
         if any(part.endswith(".egg-info") for part in path.parts):

@@ -38,6 +38,9 @@ gold/ hybrid DW:
   - ownership SCD4 + lifecycle
   - ownership SCD2 current/history
   - derived analytics mart
+        |
+        v
+dbt/  analytics schema (main_analytics.*) re-modelled from gold
 ```
 
 See [docs/architecture.md](docs/architecture.md) and [docs/data_warehouse.md](docs/data_warehouse.md) for the detailed flow, warehouse design, and SCD2/SCD4 rationale.
@@ -46,6 +49,7 @@ See [docs/architecture.md](docs/architecture.md) and [docs/data_warehouse.md](do
 
 - `sample_data/` bundled public-safe source snapshots
 - `contracts/` output contracts for bronze, silver, and gold artifacts
+- `dbt/` dbt-duckdb modelling project (analytics schema on top of gold)
 - `scripts/run_demo.py` single entrypoint for the local pipeline
 - `scripts/verify_public_safety.py` scans for banned company references and internal paths
 - `src/entity_data_lakehouse/` pipeline implementation
@@ -137,6 +141,25 @@ Gold uses a hybrid warehouse pattern inspired by the original reference repo:
 - a derived analytics mart that preserves the existing public contract
 
 These gold artifacts are also generated locally and can be rebuilt from `sample_data/` with `python3 scripts/run_demo.py`.
+
+## dbt Modelling Layer
+
+A dbt-duckdb project re-models the gold-layer DuckDB tables into a separate `main_analytics` schema, leaving the upstream `main.dw_*` / `main.mart_*` / `main.ml_*` tables untouched.
+
+```bash
+pip install -e '.[dbt]'
+python3 scripts/run_demo.py          # populate upstream gold tables first
+make dbt-run                         # materialise main_analytics.* models
+make dbt-test                        # run schema + singular data-quality tests
+```
+
+Or directly:
+
+```bash
+cd dbt && dbt run --profiles-dir . && dbt test --profiles-dir .
+```
+
+Models land in `main_analytics.*` inside `gold/entity_lakehouse.duckdb`. See [docs/data_warehouse.md](docs/data_warehouse.md) for details.
 
 ## Public-Safety Guarantees
 
