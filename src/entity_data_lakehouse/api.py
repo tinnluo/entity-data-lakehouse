@@ -42,7 +42,7 @@ from .search import EntitySearchIndex, SearchResult, build_search_index
 app = FastAPI(
     title="Entity Hybrid Search API",
     description=(
-        "BM25 (DuckDB FTS) + dense vector (sentence-transformers + Qdrant) "
+        "bm25s + dense vector (sentence-transformers + Qdrant) "
         "hybrid search over the entity master, fused with Reciprocal Rank Fusion."
     ),
     version="0.1.0",
@@ -55,8 +55,8 @@ def _get_duckdb_path() -> Path:
     env_path = os.environ.get("ENTITY_DUCKDB_PATH")
     if env_path:
         return Path(env_path)
-    # Default: two levels up from this file → repo root / gold /
-    return Path(__file__).resolve().parents[3] / "gold" / "entity_lakehouse.duckdb"
+    # Default: repo root is two levels above this file (src/entity_data_lakehouse/)
+    return Path(__file__).resolve().parents[2] / "gold" / "entity_lakehouse.duckdb"
 
 
 @app.on_event("startup")

@@ -227,6 +227,30 @@ def _build_search_text(row: dict) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
+def _qdrant_collection_matches(
+    qdrant: "QdrantClient",
+    collection_name: str,
+    expected_ids: list[str],
+) -> bool:
+    """Return True iff the persisted collection contains exactly expected_ids.
+
+    Scrolls payloads only (no vectors) and compares the stored entity_id set
+    against the current DuckDB rows.  A mismatch means the pipeline has been
+    re-run with different data and the collection must be rebuilt.
+    """
+    if not qdrant.collection_exists(collection_name):
+        return False
+    # Scroll all stored payloads (no vectors needed — cheaper).
+    results, _ = qdrant.scroll(
+        collection_name=collection_name,
+        with_payload=True,
+        with_vectors=False,
+        limit=len(expected_ids) + 1,  # +1 to detect extra points
+    )
+    stored_ids = {point.payload["entity_id"] for point in results}
+    return stored_ids == set(expected_ids)
+
+
 def build_search_index(
     duckdb_path: Path,
     qdrant_path: Path | None = None,
@@ -240,8 +264,11 @@ def build_search_index(
     qdrant_path:
         Path for persistent Qdrant local storage.  Defaults to
         ``<duckdb_path.parent>/qdrant_store/`` so the collection survives
-        restarts without re-embedding.  Pass ``Path(":memory:")`` to force
-        an in-memory (non-persistent) collection — useful in tests.
+        restarts without re-embedding.  The stored entity IDs are validated
+        against the current DuckDB rows on every call; a mismatch (e.g. after
+        the pipeline is re-run with new data) triggers a full rebuild.
+        Pass ``Path(":memory:")`` to force an in-memory (non-persistent)
+        collection — useful in tests.
     """
     _EXTRAS_MSG = (
         "Install with: pip install 'entity-data-lakehouse[search]'"
@@ -301,9 +328,14 @@ def build_search_index(
     else:
         qdrant_path.mkdir(parents=True, exist_ok=True)
         qdrant = QdrantClient(path=str(qdrant_path))
-        _collection_ready = qdrant.collection_exists(_COLLECTION_NAME)
+        _collection_ready = _qdrant_collection_matches(
+            qdrant, _COLLECTION_NAME, entity_ids
+        )
 
     if not _collection_ready:
+        # Drop stale collection if it exists (data mismatch or first-time build).
+        if str(qdrant_path) != ":memory:" and qdrant.collection_exists(_COLLECTION_NAME):
+            qdrant.delete_collection(_COLLECTION_NAME)
         qdrant.create_collection(
             collection_name=_COLLECTION_NAME,
             vectors_config=VectorParams(size=_EMBED_DIM, distance=Distance.COSINE),
