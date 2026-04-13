@@ -11,7 +11,8 @@
 2. `bronze/` receives a standardized envelope per source record with typed matching fields and a `raw_payload` JSON blob.
 3. `silver/` resolves canonical entities, standardizes asset dimensions, and emits both observation-grain tables and convenience outputs.
 4. `gold/` publishes a hybrid warehouse-oriented model and a local DuckDB database for ad hoc analysis.
-5. `ml/` (executed as the final pipeline step) enriches assets with geographic and economic features from `reference_data/`, trains three scikit-learn models on a synthetic reference dataset, and writes lifecycle predictions to `gold/dw/asset_lifecycle_predictions.parquet`.
+5. Optional hybrid search queries the current entity master with `bm25s`, sentence-transformer embeddings, local Qdrant persistence, and Reciprocal Rank Fusion.
+6. `ml/` (executed as the final pipeline step) enriches assets with geographic and economic features from `reference_data/`, trains three scikit-learn models on a synthetic reference dataset, and writes lifecycle predictions to `gold/dw/asset_lifecycle_predictions.parquet`.
 
 ## Entity Resolution
 

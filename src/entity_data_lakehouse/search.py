@@ -9,8 +9,8 @@ BM25 leg   : bm25s (pure-Python, tunable k1/b parameters) over
 Dense leg  : sentence-transformers model (all-MiniLM-L6-v2) encodes the
              query and each entity's search_text at index time.  Vectors
              are stored in a Qdrant local collection.  By default the
-             collection is persisted to gold/qdrant_store/ so the index
-             survives restarts without re-embedding.
+             collection is persisted to gold/qdrant_store/ and reused when
+             the corpus/model fingerprint matches.
 
 Fusion     : Reciprocal Rank Fusion (RRF, k=60) merges the two ranked lists
              into a single ranked result.  No raw score normalisation is

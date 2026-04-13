@@ -6,13 +6,13 @@ Test strategy
 - _build_search_text helper: pure Python — always runs.
 - Index build + search: requires [search] extras (bm25s, sentence-transformers,
   qdrant-client).  Tests are skipped automatically when the extras are absent
-  via pytest.mark.skipif.  Uses a real (tiny) gold DuckDB file produced by
+  via pytest.mark.skipif.  Uses a real (tiny) gold-layer DuckDB file produced by
   the integration pipeline fixture, so the test verifies end-to-end behaviour.
 
 Fixture pattern
 ---------------
 Follows the existing scope="module" pattern from test_ml.py: the
-gold DuckDB file is built once per module run via the integration
+gold-layer DuckDB file is built once per module run via the integration
 pipeline and reused across all search tests.
 
 Qdrant is forced to in-memory mode (qdrant_path=Path(":memory:")) so the

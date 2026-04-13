@@ -22,7 +22,7 @@ Three-layer architecture with clean separation of concerns:
 |---|---|
 | Bronze | Source envelopes: typed keys + `raw_payload` JSON blob preserving all unmapped attributes |
 | Silver | Observation-grain tables, entity master, asset master, ownership observations, relationship edges |
-| Gold | Warehouse tables (SCD4/SCD2), lifecycle metrics, analytics mart, DuckDB store |
+| Gold | Warehouse tables (SCD4/SCD2), lifecycle metrics, analytics mart, DuckDB analytics database |
 
 ### Entity Resolution and Relationship Modelling
 
@@ -107,13 +107,17 @@ used in real transition-risk and stranded-asset models.
 
 `entity_lakehouse.duckdb` — a local analytics database generated from gold outputs, queryable with standard SQL for ad-hoc exploration without additional infrastructure.
 
+### Hybrid Search API and CLI
+
+Optional BM25 + dense vector retrieval over `dw_entity_master_current` using `bm25s`, `sentence-transformers/all-MiniLM-L6-v2`, and local Qdrant. Persisted vectors live in `gold/qdrant_store/` and are reused only when the corpus/model fingerprint matches the current entity master.
+
 ### Public Safety Verification
 
 `scripts/verify_public_safety.py` — scans for banned company references, internal paths, and credentials before any commit or publish step.
 
 ### dbt Modelling Layer
 
-A dbt-duckdb project (`dbt/`) sits above the gold DuckDB and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
+A dbt-duckdb project (`dbt/`) sits above the gold-layer DuckDB database and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
 
 | dbt model | Source table | Target |
 |---|---|---|
@@ -133,7 +137,7 @@ run_pipeline_stages  >>  run_dbt  >>  run_public_safety_scan
 ```
 
 - `run_pipeline_stages` — PythonOperator: bronze → silver → gold → ML
-- `run_dbt` — BashOperator: `dbt run` + `dbt test` against the gold DuckDB
+- `run_dbt` — BashOperator: `dbt run` + `dbt test` against the gold-layer DuckDB database
 - `run_public_safety_scan` — BashOperator: public-safety scan as a final gate
 
 Uses `SequentialExecutor` + SQLite (recommended for single-machine demo). The DAG is trigger-only (`schedule=None`). See `airflow/README.md` and `docs/architecture.md` for details.

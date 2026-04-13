@@ -71,7 +71,7 @@ The existing public output, `owner_infrastructure_exposure_snapshot`, is retaine
 
 ## dbt Modelling Layer
 
-A dbt-duckdb project (`dbt/`) sits above the gold DuckDB and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
+A dbt-duckdb project (`dbt/`) sits above the gold-layer DuckDB database and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
 
 ### Schema layout
 

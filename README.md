@@ -188,7 +188,7 @@ An optional hybrid search layer queries the entity master using **BM25 + dense v
 | BM25 leg | `bm25s` (pure-Python, tunable k1/b, numpy backend) | Exact keyword matching, proper-noun precision |
 | Dense leg | `sentence-transformers/all-MiniLM-L6-v2` + Qdrant (local mode) | Semantic similarity |
 | Fusion | Reciprocal Rank Fusion (k=60, Cormack et al. 2009) | Rank-based merge — no score normalisation needed |
-| Storage | Qdrant on-disk (`gold/qdrant_store/`) | Survives restarts without re-embedding |
+| Storage | Qdrant on-disk (`gold/qdrant_store/`) | Reused when the corpus/model fingerprint matches |
 
 **Install search extras:**
 
@@ -235,7 +235,7 @@ Rank  RRF Score    BM25↑   Vec↑    Entity                              Count
 **Design notes:**
 
 - `bm25s` builds the BM25 inverted index entirely in memory (no DuckDB writes) with tunable `k1=1.5` (term-frequency saturation) and `b=0.75` (document-length normalisation) parameters.  This replaces the DuckDB FTS extension, which offered no tunable k1/b parameters and rebuilt the index on every call.
-- Qdrant runs in local on-disk mode (`gold/qdrant_store/`); the collection is only built and embedded once.  Pass `qdrant_path=Path(":memory:")` in tests or demos where persistence is unwanted.
+- Qdrant runs in local on-disk mode (`gold/qdrant_store/`); persisted vectors are reused only when the stored corpus/model fingerprint matches the current entity master.  Pass `qdrant_path=Path(":memory:")` in tests or demos where persistence is unwanted.
 - The RRF constant k=60 is the standard value from the original paper; it prevents top-ranked items in a single list from dominating when the other list has no match.
 - Linear score combination (e.g. `0.7 * vector + 0.3 * bm25`) is intentionally avoided: raw BM25 and cosine scores are not comparable and are not linearly separable in score space.
 
