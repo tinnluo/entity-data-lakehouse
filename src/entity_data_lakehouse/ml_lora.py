@@ -19,8 +19,12 @@ import json
 import logging
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from entity_data_lakehouse.observability import get_langfuse
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 logger = logging.getLogger(__name__)
 

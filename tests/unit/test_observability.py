@@ -11,9 +11,7 @@ Verifies:
 from __future__ import annotations
 
 import warnings
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 
 # ---------------------------------------------------------------------------

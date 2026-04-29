@@ -6,7 +6,7 @@ All clickhouse_connect calls are mocked — no running ClickHouse server require
 from __future__ import annotations
 
 import sys
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
@@ -366,7 +366,6 @@ def test_partial_failure_rolls_back_already_swapped_tables(monkeypatch) -> None:
 
     # After failure the first successful EXCHANGE must be reversed.
     # The rollback fires another EXCHANGE on the first table.
-    rollback_exchanges = [c for c in exchange_calls if exchange_calls.count(c) == 0 or True]
     all_commands = [str(c.args[0]) for c in mock_client.command.call_args_list]
 
     # batch_log must NOT have been published.

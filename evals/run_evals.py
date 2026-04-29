@@ -102,7 +102,7 @@ def run_evals(
     dict
         The report dictionary (same content as the written JSON file).
     """
-    from sklearn.metrics import accuracy_score, f1_score
+    from sklearn.metrics import accuracy_score
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import LabelEncoder
 
@@ -233,8 +233,6 @@ def _validate_sklearn_predictions(models, train_df, test_df, le) -> bool:
     False otherwise.  This is a lightweight contract check that does not
     require loading the full JSON schema.
     """
-    from sklearn.preprocessing import LabelEncoder
-
     X_test = test_df[_FEATURE_COLS].values
     sk_pred_encoded = models["lifecycle_stage_clf"].predict(X_test)
     sk_pred = le.inverse_transform(sk_pred_encoded).tolist()

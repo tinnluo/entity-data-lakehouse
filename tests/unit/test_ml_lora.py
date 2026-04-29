@@ -102,7 +102,6 @@ def test_predict_lifecycle_lora_returns_valid_stage(
     """
     import math
     import sys
-    from unittest.mock import MagicMock
 
     # Prompt tokens = [1, 2, 3]; each stage gets a single-token label.
     PROMPT_TOKEN_IDS = [1, 2, 3]
@@ -242,7 +241,6 @@ def test_predict_lifecycle_lora_propagates_forward_pass_exception(
     corrected behaviour lets the caller decide how to handle the failure.
     """
     import sys
-    from unittest.mock import MagicMock
 
     torch_mock = MagicMock()
     torch_mock.no_grad.return_value.__enter__ = lambda s: None
