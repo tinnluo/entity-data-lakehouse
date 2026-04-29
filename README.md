@@ -1,19 +1,19 @@
-# entity-data-lakehouse
+# Entity Data Lakehouse
 
-A compact medallion-style lakehouse demo that ingests public entity and infrastructure data, normalizes it into a shared entity model, and emits analytics-ready outputs.
+`entity-data-lakehouse` is a public-safe reconstruction of a production-style entity and infrastructure lakehouse.
+The interesting part is not dataset size. The interesting part is the contract around it: bronze -> silver -> gold layering, hybrid SCD warehouse outputs, deterministic rebuilds, and optional production-style extensions that do not compromise the default local DuckDB path.
 
-This public demo rebuilds a production architectural pattern in a public-safe form. It preserves system design, module boundaries, and execution flow while removing proprietary business logic and internal data.
+## Why This Repo Is Worth Reviewing
 
-This demo shows a medallion-style entity and infrastructure pipeline, mirrors a production warehouse pattern with bronze, silver, and gold layers plus SCD2/SCD4 warehouse design, intentionally generalizes source details and removes private operating context, and exists in the portfolio to demonstrate architecture and pipeline design in a runnable public repo.
+| Signal | Why it matters |
+|---|---|
+| Bronze -> silver -> gold discipline | The repo demonstrates contract-driven staging instead of one-shot transformation scripts. |
+| Hybrid warehouse outputs | Entity and ownership history are modeled with both SCD4 and SCD2 patterns so consumers can choose full observational fidelity or stable current/history tables. |
+| Default-local, optional-production shape | DuckDB remains authoritative, while dbt, Airflow, ClickHouse, search, LoRA, and Langfuse are all explicit opt-ins. |
+| Safe ML extension path | The sklearn baseline remains the default; the LoRA path is constrained, revision-pinned, trusted-root validated, and falls back cleanly when unavailable. |
+| Rebuildable architecture demo | `sample_data/` plus bundled reference data are sufficient to rebuild the entire demo locally with no external services required. |
 
 ## Overview
-
-This repository is designed as a public portfolio project. It focuses on:
-
-- bronze, silver, and gold data layering
-- entity and relationship modeling
-- warehouse-oriented outputs
-- deterministic local execution with bundled sample snapshots
 
 The sample scenario combines:
 
@@ -21,36 +21,65 @@ The sample scenario combines:
 - parent-child entity hierarchy data
 - infrastructure asset ownership records
 
-## Architecture
+## Architecture At A Glance
 
-```text
-sample_data/ CSV snapshots
-        |
-        v
-bronze/ source envelopes with typed keys + raw_payload
-        |
-        v
-silver/ observation tables + convenience dimensions
-        |
-        v
-gold/ hybrid DW:
-  - entity master SCD4
-  - ownership SCD4 + lifecycle
-  - ownership SCD2 current/history
-  - derived analytics mart
-        |
-        v
-dbt/  analytics schema (main_analytics.*) re-modelled from gold
+```mermaid
+flowchart TD
+
+subgraph INPUTS["Inputs"]
+  S["sample_data/<br/>public-safe CSV snapshots"]
+  R["reference_data/<br/>country + sector enrichment"]
+end
+
+subgraph PIPE["Lakehouse pipeline"]
+  B["bronze/<br/>source envelopes + raw_payload"]
+  SI["silver/<br/>canonical entities, assets, ownership observations"]
+  ML["ML step<br/>sklearn baseline + optional LoRA override"]
+  G["gold/<br/>DuckDB + parquet warehouse outputs"]
+end
+
+subgraph EXT["Optional consumers and extensions"]
+  D["dbt<br/>main_analytics.*"]
+  HS["Hybrid search<br/>BM25 + vectors + RRF"]
+  CH["ClickHouse<br/>write-through analytics sink"]
+  LF["Langfuse<br/>optional telemetry"]
+end
+
+S --> B --> SI --> G
+R --> ML
+SI --> ML --> G
+G --> D
+G --> HS
+G -. "USE_CLICKHOUSE=true" .-> CH
+ML -. "LANGFUSE_* set" .-> LF
+
+classDef bronze fill:#ffe6e6,stroke:#b30000,color:#111827,stroke-width:1.5px
+classDef silver fill:#e6f0ff,stroke:#003399,color:#111827,stroke-width:1.5px
+classDef golden fill:#e6ffe6,stroke:#006400,color:#111827,stroke-width:1.5px
+classDef external fill:#fce8ff,stroke:#7b2fa8,color:#111827,stroke-width:1.5px,stroke-dasharray:6 4
+classDef artifact fill:#fff8e1,stroke:#e65100,color:#111827,stroke-width:1.5px,stroke-dasharray:6 4
+
+class S,B bronze
+class SI,ML silver
+class G golden
+class R,CH,LF external
+class D,HS artifact
+
+style INPUTS fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
+style PIPE fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
+style EXT fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
 ```
 
-See [docs/architecture.md](docs/architecture.md) and [docs/data_warehouse.md](docs/data_warehouse.md) for the detailed flow, warehouse design, and SCD2/SCD4 rationale.
+See [docs/architecture.md](docs/architecture.md) and [docs/data_warehouse.md](docs/data_warehouse.md) for the detailed system view, warehouse design, and SCD2/SCD4 rationale.
+
+This is the core idea the repo is trying to show: the pipeline is not just a few parquet writes. It is a staged warehouse pattern with explicit contracts, history-aware outputs, optional ML enrichment, and safe production-style extension points.
 
 ## Repository Map
 
 - `sample_data/` bundled public-safe source snapshots
 - `contracts/` output contracts for bronze, silver, and gold artifacts
 - `dbt/` dbt-duckdb modelling project (analytics schema on top of gold)
-- `scripts/run_demo.py` single entrypoint for the local pipeline
+- `scripts/run_demo.py` and `scripts/run_pipeline.py` local pipeline entrypoints
 - `scripts/verify_public_safety.py` scans for banned company references and internal paths
 - `src/entity_data_lakehouse/` pipeline implementation
 - `bronze/`, `silver/`, `gold/` generated run artifacts; reproducible locally and ignored by default
@@ -167,9 +196,12 @@ An Airflow DAG wraps the full pipeline for orchestration demo purposes, runnable
 
 ```bash
 docker compose build airflow
-docker compose up airflow       # UI at http://localhost:8080 — admin/admin
-make airflow-up                 # equivalent shorthand
+docker compose up airflow
+make airflow-up
 ```
+
+UI: `http://localhost:8080`
+Login: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from your `.env`
 
 The DAG `entity_lakehouse_pipeline` runs three tasks in sequence:
 `run_pipeline_stages` → `run_dbt` → `run_public_safety_scan`.
@@ -241,32 +273,174 @@ Rank  RRF Score    BM25↑   Vec↑    Entity                              Count
 
 ## LoRA Fine-Tuning Demo
 
-An optional LoRA-tuned LLM path overrides the `predicted_lifecycle_stage` column when
-`ML_BACKEND=lora` is set.  All other predictions (retirement year, capacity factor) always
-use scikit-learn, so integration-test row counts are unchanged.
+An optional LoRA path overrides only the lifecycle-stage classification columns:
 
-**Hardware:** MPS (Apple Silicon) or CUDA recommended; CPU is slow but functional.
+- `predicted_lifecycle_stage`
+- `lifecycle_stage_confidence`
+
+All other ML outputs, including retirement year and capacity factor, remain on the sklearn baseline.
+When `ML_BACKEND` is unset, `ml_lora` is not imported and behaviour is identical to the default path.
+
+**What is implemented:**
+
+- teacher-forced label scoring over the full stage token sequence, not `generate()`
+- chunked batched inference for throughput, with per-row retry if a chunk fails
+- clean sklearn fallback when the adapter is missing, invalid, or the optional deps are unavailable
+- pinned base model and pinned revision, persisted as `adapter_metadata.json`
+- trusted adapter root validation: `LORA_ADAPTER_PATH` must resolve under `models/`
+
+**Hardware:** MPS (Apple Silicon) or CUDA recommended. CPU is functional but slow.
 
 ```bash
 pip install -e '.[lora]'
 
-# Train adapter on synthetic data (≈5 min on MPS):
+# Train adapter on synthetic data:
 python scripts/train_lora.py --samples 200 --epochs 1
+
+# Optional: train against an explicit pinned revision
+python scripts/train_lora.py --samples 200 --epochs 1 --revision "$LORA_BASE_MODEL_REVISION"
 
 # Evaluate LoRA vs sklearn baseline:
 python scripts/eval_lora.py
 
-# Run pipeline with LoRA lifecycle stage:
-ML_BACKEND=lora python scripts/run_pipeline.py
+# Run pipeline with LoRA lifecycle-stage override:
+ML_BACKEND=lora python scripts/run_demo.py
 
-# Default (ML_BACKEND unset) — identical to baseline, ml_lora never imported:
-python scripts/run_pipeline.py
+# Default baseline path:
+python scripts/run_demo.py
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full design rationale.
+See [docs/architecture.md](docs/architecture.md) for the loading constraints, fallback model, and observability design.
 
-## Public-Safety Guarantees
+## Eval Harness
 
-- This repository is a public-safe demo distilled from a production project.
-- Sample data is bundled, security-safe, and intentionally small.
-- No secrets, private URLs, credentials, or internal absolute paths are required to run the demo.
+A standalone eval harness compares the sklearn baseline against the LoRA adapter
+(when available) on a held-out synthetic test set:
+
+```bash
+make eval
+# or directly:
+python evals/run_evals.py
+```
+
+The report is written to `evals/output/latest_report.json` and includes accuracy,
+per-class F1, and runtime for both backends. The LoRA entry is skipped gracefully
+if the adapter has not been trained or fails validation.
+
+## ClickHouse Analytics Backend (optional)
+
+By default the pipeline writes only to DuckDB (`gold/entity_lakehouse.duckdb`).
+An optional ClickHouse sink is available for production-style OLAP queries, but DuckDB remains the source of truth.
+
+**Start with ClickHouse:**
+
+```bash
+USE_CLICKHOUSE=true docker compose --profile clickhouse up --build
+# or via Makefile:
+make clickhouse-up
+```
+
+**Stop:**
+
+```bash
+make clickhouse-down
+```
+
+The sink auto-creates the `lakehouse` database (or `CLICKHOUSE_DATABASE` if overridden)
+and then creates three MergeTree tables:
+
+| Table | Contents |
+|---|---|
+| `ownership_current` | Current ownership positions |
+| `owner_infrastructure_exposure_snapshot` | Per-owner exposure snapshots |
+| `ml_asset_lifecycle_predictions` | ML lifecycle predictions |
+
+Each sink load is an atomic full refresh:
+
+- rows are first written into staging tables
+- live and staging tables are swapped with `EXCHANGE TABLES`
+- already-swapped tables are rolled back if a later table fails
+- the successful `batch_id` is only published after all three tables refresh
+
+This keeps DuckDB authoritative while ensuring ClickHouse readers never see partially refreshed live tables.
+
+The `lakehouse` service is a no-op when `USE_CLICKHOUSE` is unset or `false`; the
+default `docker compose up --build` path is unaffected.
+
+**Connection config** (all optional; shown with defaults):
+
+```bash
+CLICKHOUSE_HOST=clickhouse
+CLICKHOUSE_PORT=8123
+CLICKHOUSE_DATABASE=lakehouse
+CLICKHOUSE_USER=default
+CLICKHOUSE_PASSWORD=
+CLICKHOUSE_SECURE=false
+CLICKHOUSE_VERIFY=true
+CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK=false
+```
+
+Copy `.env.example` to `.env` to configure locally.
+
+**Security notes:**
+
+- the compose file binds ClickHouse to `127.0.0.1`
+- plaintext HTTP is rejected for non-local/public hosts
+- `CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK=true` is only intended for trusted private or compose networks, never public hosts
+- the Airflow service requires an explicit `AIRFLOW_ADMIN_PASSWORD` in `.env`
+
+## Observability (optional)
+
+ML, training, and eval traces can be forwarded to [Langfuse](https://langfuse.com):
+
+```bash
+pip install -e '.[observability]'
+```
+
+Set credentials in `.env` (see `.env.example`):
+
+```bash
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://cloud.langfuse.com   # or your self-hosted URL
+```
+
+Current telemetry surface:
+
+| Event | Source |
+|---|---|
+| `sklearn_build_ml_predictions` trace + `build_ml_predictions` span | `ml.py` |
+| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` chunk-level aggregate telemetry |
+| `lora_training` trace + `train_lora_adapter` span | `scripts/train_lora.py` |
+| `eval_lora` trace | `scripts/eval_lora.py` |
+
+When credentials are absent the repo still runs normally: a one-time warning is emitted and all Langfuse calls degrade to no-ops. Telemetry failures are intentionally non-fatal in both the pipeline and the training script.
+
+## Where To Look First
+
+| If you care about... | Start here |
+|---|---|
+| End-to-end pipeline orchestration | `src/entity_data_lakehouse/pipeline.py` and `scripts/run_demo.py` |
+| Bronze/silver/gold modeling | `src/entity_data_lakehouse/bronze.py`, `silver.py`, `gold.py` |
+| Warehouse semantics and SCD rationale | `docs/data_warehouse.md` |
+| Optional ClickHouse sink behavior | `src/entity_data_lakehouse/clickhouse_sink.py` |
+| Baseline ML plus optional LoRA override | `src/entity_data_lakehouse/ml.py` and `ml_lora.py` |
+| Hybrid retrieval and API surface | `src/entity_data_lakehouse/search.py` and `api.py` |
+| Optional observability boundary | `src/entity_data_lakehouse/observability.py` |
+
+## Public-Safe Boundaries
+
+What this repo preserves from the production pattern:
+
+- staged medallion execution flow
+- entity resolution and relationship modeling shape
+- SCD2/SCD4 warehouse design
+- optional orchestration, ML, search, OLAP, and observability extension points
+- local rebuildability and contract-driven outputs
+
+What is intentionally generalized or removed:
+
+- proprietary business rules and private source systems
+- internal datasets and rollout controls
+- company-specific credentials, URLs, and infrastructure paths
+- any requirement for private services to run the default demo

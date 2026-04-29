@@ -11,3 +11,5 @@ dbt/target/
 dbt/dbt_packages/
 dbt/logs/
 /models/
+
+evals/output/*.json

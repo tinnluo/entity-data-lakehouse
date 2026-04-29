@@ -1,6 +1,10 @@
 # Data Warehouse Design
 
-The gold layer uses a hybrid design inspired by the original reference repo.
+This document focuses only on the gold-layer warehouse model.
+
+It does not repeat the full runtime architecture, Airflow setup, ClickHouse sink, or ML/LoRA workflow. For those, see [`architecture.md`](architecture.md) and [`../README.md`](../README.md).
+
+The gold layer uses a hybrid design: SCD4 where full snapshot preservation matters, SCD2 where downstream consumers need a stable current/history contract, and a derived mart for analytics consumption.
 
 ## Why Both SCD4 And SCD2 Exist
 
@@ -9,7 +13,7 @@ The public source snapshots can change in two different ways:
 - the real world changes, such as ownership percentages moving
 - the source scope changes, such as a relationship disappearing and then returning later
 
-The demo uses:
+The warehouse therefore publishes both patterns:
 
 - **SCD4** where full snapshot preservation matters
 - **SCD2** where consumers need a stable current/history contract
@@ -36,7 +40,7 @@ This preserves the distinction between:
 
 ## Ownership: SCD4 + Lifecycle
 
-Ownership observations are modeled separately from the convenience relationship edge output.
+Ownership observations are modeled separately from the convenience relationship-edge output.
 
 `ownership_comprehensive_scd4` stores every ownership observation snapshot plus explicit dropped rows. `ownership_lifecycle` then aggregates by `owner_entity_id|asset_id` to calculate:
 
@@ -55,7 +59,7 @@ The repo also publishes:
 - `ownership_history_scd2`
 - `ownership_current`
 
-These follow the original repo’s incumbent ownership-contract idea: keep a stable current/history table for downstream consumers while preserving explicit version rows.
+These follow the same design intent as the production pattern: keep a stable current/history table for downstream consumers while preserving explicit version rows.
 
 The business key is source-isolated:
 
@@ -69,9 +73,11 @@ Changes in ownership percentage or asset-facing business attributes create a new
 
 The existing public output, `owner_infrastructure_exposure_snapshot`, is retained as a derived mart. It is rebuilt from the SCD2 history table using as-of logic for every snapshot date present in the SCD4 pipeline.
 
+This keeps the public analytics surface simple while the richer historical model remains available underneath.
+
 ## dbt Modelling Layer
 
-A dbt-duckdb project (`dbt/`) sits above the gold-layer DuckDB database and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline completely untouched.
+A dbt-duckdb project (`dbt/`) sits above the gold-layer DuckDB database and re-models the warehouse tables into a separate analytics schema (`main_analytics`). This leaves the upstream `main.dw_*`, `main.mart_*`, and `main.ml_*` tables produced by the Python pipeline untouched.
 
 ### Schema layout
 
@@ -92,11 +98,4 @@ Singular tests (in `dbt/tests/`) assert:
 - `assert_owner_exposure_grain.sql` — `(snapshot_date, owner_entity_id, asset_country, asset_sector)` is unique
 - `assert_owner_exposure_nonneg_capacity.sql` — `owned_capacity_mw >= 0` and `0 <= average_ownership_pct <= 100`
 
-### Running
-
-```bash
-pip install -e '.[dbt]'
-cd dbt && dbt run --profiles-dir . && dbt test --profiles-dir .
-```
-
-Or via `make dbt-run` and `make dbt-test` from the repo root.
+Run instructions live in the repo `README.md`; they are intentionally not duplicated here.

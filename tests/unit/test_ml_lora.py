@@ -23,6 +23,7 @@ import pytest
 from entity_data_lakehouse.ml import _FEATURE_COLS
 from entity_data_lakehouse.ml_lora import (
     LIFECYCLE_STAGES,
+    _TELEMETRY_SAFE_COLS,
     features_to_prompt,
     generate_instruction_jsonl,
     predict_lifecycle_lora,
@@ -86,70 +87,140 @@ def test_generate_instruction_jsonl_roundtrip(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _make_stub_tokenizer(return_stage: str = "operating"):
-    """Return a mock tokenizer whose decode() returns the given stage."""
-    tok = MagicMock()
-    tok.pad_token_id = 0
-    # encode: return a dict with input_ids of shape (1, 5)
-    import torch
-
-    tok.return_value = {"input_ids": torch.zeros(1, 5, dtype=torch.long)}
-    tok.decode.return_value = return_stage
-    return tok
-
-
-def _make_stub_model(return_ids=None):
-    """Return a mock model whose generate() returns a fixed token tensor."""
-    import torch
-
-    model = MagicMock()
-    if return_ids is None:
-        return_ids = torch.zeros(1, 6, dtype=torch.long)
-    model.generate.return_value = return_ids
-    return model
-
-
 def test_predict_lifecycle_lora_returns_valid_stage(
     tmp_path: Path, monkeypatch
 ) -> None:
     """predict_lifecycle_lora must return a stage in LIFECYCLE_STAGES and 0 <= conf <= 1.
 
-    All torch calls are intercepted by monkeypatching load_lora_model so this
-    test runs without torch installed.
+    The new implementation scores all 5 candidate labels in a single batched
+    forward pass using teacher-forced log-probs and applies softmax.  We stub
+    torch entirely so the test runs without any heavy deps.
+
+    Strategy: make the "operating" label accumulate a much higher log-prob
+    than the others, so after softmax the function must return
+    ("operating", high_confidence).
     """
-    # The stub tokenizer returns a MagicMock with an 'input_ids' attribute.
-    # predict_lifecycle_lora only needs:
-    #   tokenizer(prompt, return_tensors="pt")  -> inputs with inputs["input_ids"].shape[1]
-    #   tokenizer.decode(...)                    -> stage string
-    stub_inputs = MagicMock()
-    stub_inputs.__getitem__ = lambda self, key: stub_inputs  # inputs["input_ids"]
-    stub_inputs.shape = [1, 5]  # shape[1] == 5
-
-    stub_tok = MagicMock()
-    stub_tok.pad_token_id = 0
-    stub_tok.return_value = stub_inputs
-    stub_tok.decode.return_value = "operating"
-
-    # The stub model's generate() returns an object where [0][5:] is sliceable.
-    stub_output = MagicMock()
-    stub_output.__getitem__ = MagicMock(return_value=MagicMock())
-
-    stub_model = MagicMock()
-    stub_model.generate.return_value = stub_output
-
-    import entity_data_lakehouse.ml_lora as ml_lora_mod
-
-    # Also patch torch.no_grad() since predict_lifecycle_lora uses it as a context manager.
+    import math
     import sys
+    from unittest.mock import MagicMock
+
+    # Prompt tokens = [1, 2, 3]; each stage gets a single-token label.
+    PROMPT_TOKEN_IDS = [1, 2, 3]
+    STAGE_TOKEN_IDS = {s: i + 10 for i, s in enumerate(LIFECYCLE_STAGES)}
+    HOT_ID = STAGE_TOKEN_IDS["operating"]  # 12
+
+    # ---------------------------------------------------------------------------
+    # torch.tensor — returns a list-of-lists wrapper
+    # ---------------------------------------------------------------------------
+    def _fake_tensor(data, dtype=None):
+        return data
+
+    # ---------------------------------------------------------------------------
+    # torch.log_softmax on 3-D (batch, seq, vocab) → returns a 3-D wrapper.
+    # ---------------------------------------------------------------------------
+    def _fake_log_softmax(logits_3d, dim=-1):
+        return _FakeLogSoftmax3D(logits_3d)
+
+    class _FakeLogSoftmax3D:
+        """Wraps the 3-D logits list; supports [int, slice, list] indexing."""
+        def __init__(self, data):
+            self._data = data  # list of (list of rows)
+
+        def __getitem__(self, key):
+            batch_idx, row_slice, col_ids = key
+            rows = self._data[batch_idx][row_slice]
+            return _FakeMatrix([[self._row_val(r, c) for c in col_ids] for r in rows])
+
+        @staticmethod
+        def _row_val(row, col_id):
+            if isinstance(row, dict):
+                return row.get(col_id, -5.0)
+            return -5.0
+
+    class _FakeMatrix:
+        def __init__(self, data):
+            self._data = data
+
+        def diag(self):
+            n = min(len(self._data), len(self._data[0]) if self._data else 0)
+            return _FakeVec([self._data[i][i] for i in range(n)])
+
+    class _FakeVec:
+        def __init__(self, vals):
+            self._vals = vals
+
+        def sum(self):
+            return _FakeScalar(sum(self._vals))
+
+    class _FakeScalar:
+        def __init__(self, v):
+            self._v = float(v)
+
+        def item(self):
+            return self._v
+
+    # ---------------------------------------------------------------------------
+    # torch.softmax over the 5 label log-probs.
+    # ---------------------------------------------------------------------------
+    def _fake_softmax(tensor, dim=0):
+        vals = [float(v) for v in tensor]
+        max_v = max(vals)
+        exps = [math.exp(v - max_v) for v in vals]
+        s = sum(exps)
+        return [_FakeScalar(e / s) for e in exps]
+
+    def _fake_argmax(tensor):
+        vals = [v.item() if hasattr(v, "item") else float(v) for v in tensor]
+        m = MagicMock()
+        m.item.return_value = vals.index(max(vals))
+        return m
 
     torch_mock = MagicMock()
     torch_mock.no_grad.return_value.__enter__ = lambda s: None
     torch_mock.no_grad.return_value.__exit__ = lambda s, *a: None
+    torch_mock.tensor.side_effect = _fake_tensor
+    torch_mock.log_softmax.side_effect = _fake_log_softmax
+    torch_mock.softmax.side_effect = _fake_softmax
+    torch_mock.argmax.side_effect = _fake_argmax
+
     monkeypatch.setitem(sys.modules, "torch", torch_mock)
 
-    monkeypatch.setattr(
-        ml_lora_mod, "load_lora_model", lambda _: (stub_model, stub_tok)
-    )
+    # ---------------------------------------------------------------------------
+    # Tokenizer stub
+    # ---------------------------------------------------------------------------
+    stub_tok = MagicMock()
+    stub_tok.pad_token = None
+
+    def _encode(text, add_special_tokens=True):
+        if not add_special_tokens:
+            for stage in LIFECYCLE_STAGES:
+                if text == " " + stage:
+                    return [STAGE_TOKEN_IDS[stage]]
+            return [99]
+        return PROMPT_TOKEN_IDS
+
+    stub_tok.encode.side_effect = _encode
+
+    # ---------------------------------------------------------------------------
+    # Model stub: returns 3-D logits (5, seq_len, vocab_size).
+    # Each "row" is a dict mapping token_id → logit value.
+    # operating's token gets -0.1, everything else gets -5.0.
+    # ---------------------------------------------------------------------------
+    seq_len = len(PROMPT_TOKEN_IDS) + 1  # +1 for single-token label
+
+    def _make_vocab_row():
+        return {tid: (-0.1 if tid == HOT_ID else -5.0) for tid in STAGE_TOKEN_IDS.values()}
+
+    batch_logits = [[_make_vocab_row() for _ in range(seq_len)] for _ in range(len(LIFECYCLE_STAGES))]
+
+    class _FakeForwardOut:
+        logits = batch_logits
+
+    stub_model = MagicMock()
+    stub_model.return_value = _FakeForwardOut()
+
+    import entity_data_lakehouse.ml_lora as ml_lora_mod
+    monkeypatch.setattr(ml_lora_mod, "load_lora_model", lambda _dir, _rev="x": (stub_model, stub_tok, "test-base-model"))
 
     adapter_dir = tmp_path / "adapter"
     adapter_dir.mkdir()
@@ -157,6 +228,42 @@ def test_predict_lifecycle_lora_returns_valid_stage(
 
     assert stage in LIFECYCLE_STAGES, f"stage {stage!r} not in LIFECYCLE_STAGES"
     assert 0.0 <= conf <= 1.0, f"confidence {conf} out of [0, 1]"
+    assert stage == "operating", f"expected 'operating' (highest logit), got {stage!r}"
+    assert conf > 0.9, f"expected high confidence for dominant logit, got {conf}"
+
+
+def test_predict_lifecycle_lora_propagates_forward_pass_exception(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """predict_lifecycle_lora must re-raise exceptions from the forward pass.
+
+    The old behaviour silently returned ("operating", 0.5) on any failure,
+    which would corrupt output data and misreport model provenance.  The
+    corrected behaviour lets the caller decide how to handle the failure.
+    """
+    import sys
+    from unittest.mock import MagicMock
+
+    torch_mock = MagicMock()
+    torch_mock.no_grad.return_value.__enter__ = lambda s: None
+    torch_mock.no_grad.return_value.__exit__ = lambda s, *a: None
+    monkeypatch.setitem(sys.modules, "torch", torch_mock)
+
+    stub_tok = MagicMock()
+    stub_tok.pad_token = None
+    stub_tok.encode.return_value = [1, 2, 3]
+
+    stub_model = MagicMock()
+    stub_model.side_effect = RuntimeError("simulated forward-pass failure")
+
+    import entity_data_lakehouse.ml_lora as ml_lora_mod
+    monkeypatch.setattr(ml_lora_mod, "load_lora_model", lambda _dir, _rev="x": (stub_model, stub_tok, "test-base-model"))
+
+    adapter_dir = tmp_path / "adapter"
+    adapter_dir.mkdir()
+
+    with pytest.raises(RuntimeError, match="simulated forward-pass failure"):
+        predict_lifecycle_lora(_make_fake_features(), adapter_dir=adapter_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -255,8 +362,11 @@ def test_build_ml_predictions_sklearn_by_default(
 def test_build_ml_predictions_lora_override(
     monkeypatch, tmp_path: Path, _pipeline_inputs
 ) -> None:
-    """When ML_BACKEND=lora and adapter exists, the stub is called per row."""
-    adapter_dir = tmp_path / "lifecycle_lora_adapter"
+    """When ML_BACKEND=lora and adapter exists, the batch stub is called."""
+    # Adapter must live under the trusted root (gold_root.parent / "models").
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    adapter_dir = models_root / "lifecycle_lora_adapter"
     adapter_dir.mkdir()
 
     monkeypatch.setenv("ML_BACKEND", "lora")
@@ -264,14 +374,14 @@ def test_build_ml_predictions_lora_override(
 
     call_count = 0
 
-    def _stub_predict(features: dict, adapter_dir) -> tuple[str, float]:
+    def _stub_batch(features_df, adapter_dir, **kwargs):
         nonlocal call_count
         call_count += 1
-        return "operating", 0.9
+        return [("operating", 0.9) for _ in range(len(features_df))]
 
     import entity_data_lakehouse.ml_lora as ml_lora_mod
 
-    monkeypatch.setattr(ml_lora_mod, "predict_lifecycle_lora", _stub_predict)
+    monkeypatch.setattr(ml_lora_mod, "predict_lifecycle_lora_batch", _stub_batch)
 
     # Also patch the import inside ml.py so it picks up our monkeypatched version.
     with patch("entity_data_lakehouse.ml.validate_dataframe"):
@@ -296,8 +406,7 @@ def test_build_ml_predictions_lora_override(
     n_rows = len(predictions)
     assert n_rows > 0
 
-    # Stub was called once per row.
-    assert call_count == n_rows, f"Expected {n_rows} calls, got {call_count}"
+    assert call_count == 1, f"Expected 1 batch call, got {call_count}"
 
     # All lifecycle stages should be 'operating' (what the stub returns).
     assert (predictions["predicted_lifecycle_stage"] == "operating").all()
@@ -308,5 +417,163 @@ def test_build_ml_predictions_lora_override(
     assert predictions["estimated_retirement_year"].notna().all()
     assert predictions["predicted_capacity_factor_pct"].notna().all()
 
-    # model_version should have '+lora' suffix.
+    # model_version should have '+lora' suffix on every row that succeeded.
     assert predictions["model_version"].str.endswith("+lora").all()
+
+
+def test_build_ml_predictions_lora_failure_keeps_sklearn_row(
+    monkeypatch, tmp_path: Path, _pipeline_inputs
+) -> None:
+    """When predict_lifecycle_lora_batch returns None, the sklearn row must be
+    preserved and model_version must NOT have '+lora' appended."""
+    models_root = tmp_path / "models"
+    models_root.mkdir()
+    adapter_dir = models_root / "lifecycle_lora_adapter"
+    adapter_dir.mkdir()
+
+    monkeypatch.setenv("ML_BACKEND", "lora")
+    monkeypatch.setenv("LORA_ADAPTER_PATH", str(adapter_dir))
+
+    def _stub_batch_failure(features_df, adapter_dir, **kwargs):
+        return [None for _ in range(len(features_df))]
+
+    import entity_data_lakehouse.ml_lora as ml_lora_mod
+
+    monkeypatch.setattr(ml_lora_mod, "predict_lifecycle_lora_batch", _stub_batch_failure)
+
+    with patch("entity_data_lakehouse.ml.validate_dataframe"):
+        with patch.dict("sys.modules", {"entity_data_lakehouse.ml_lora": ml_lora_mod}):
+            from entity_data_lakehouse.ml import build_ml_predictions
+
+            gold_root = tmp_path / "gold"
+            gold_root.mkdir(exist_ok=True)
+            (gold_root / "dw").mkdir(exist_ok=True)
+
+            result = build_ml_predictions(
+                gold_root=gold_root,
+                silver_outputs=_pipeline_inputs["silver_outputs"],
+                gold_outputs=_pipeline_inputs["gold_outputs"],
+                reference_root=Path(__file__).resolve().parents[2] / "reference_data",
+                contract_paths={
+                    "asset_lifecycle_predictions": tmp_path / "contract.json"
+                },
+            )
+
+    predictions = result["asset_lifecycle_predictions"]
+    assert len(predictions) > 0
+
+    # No row should have '+lora' — all failures fell back to sklearn.
+    assert not predictions["model_version"].str.endswith("+lora").any(), (
+        "Expected no +lora suffix when every LoRA call failed"
+    )
+    # The stage column must still be valid sklearn output (not silently biased to 'operating').
+    assert predictions["predicted_lifecycle_stage"].isin(
+        ["planning", "construction", "operating", "decommissioning", "retired"]
+    ).all()
+
+
+# ---------------------------------------------------------------------------
+# _TELEMETRY_SAFE_COLS whitelist
+# ---------------------------------------------------------------------------
+
+
+_SENSITIVE_COLS = {"latitude", "longitude", "altitude_avg_m", "capacity_mw"}
+_IDENTIFIER_COLS = {"asset_id", "asset_name", "asset_country", "asset_sector"}
+
+
+def test_telemetry_safe_cols_excludes_sensitive_geo_and_capacity() -> None:
+    """Raw lat/lon, altitude, and capacity must not be in the telemetry whitelist."""
+    for col in _SENSITIVE_COLS:
+        assert col not in _TELEMETRY_SAFE_COLS, (
+            f"Sensitive column '{col}' must not be in _TELEMETRY_SAFE_COLS"
+        )
+
+
+def test_telemetry_safe_cols_excludes_identifiers() -> None:
+    """Entity identifiers must not appear in the telemetry whitelist."""
+    for col in _IDENTIFIER_COLS:
+        assert col not in _TELEMETRY_SAFE_COLS, (
+            f"Identifier column '{col}' must not be in _TELEMETRY_SAFE_COLS"
+        )
+
+
+def test_telemetry_safe_cols_is_subset_of_feature_cols() -> None:
+    """Every column in _TELEMETRY_SAFE_COLS must exist in _FEATURE_COLS."""
+    unknown = _TELEMETRY_SAFE_COLS - set(_FEATURE_COLS)
+    assert not unknown, (
+        f"_TELEMETRY_SAFE_COLS contains columns not in _FEATURE_COLS: {unknown}"
+    )
+
+
+def test_emit_lora_chunk_emits_aggregate_telemetry(monkeypatch) -> None:
+    """_emit_lora_chunk must emit chunk-level aggregate data, not per-row features."""
+    from entity_data_lakehouse.ml_lora import _emit_lora_chunk
+
+    captured: list[dict] = []
+
+    class _FakeGen:
+        def end(self): pass
+
+    class _FakeLF:
+        def generation(self, **kwargs):
+            captured.append(kwargs)
+            return _FakeGen()
+
+    monkeypatch.setattr(
+        "entity_data_lakehouse.ml_lora.get_langfuse",
+        lambda: _FakeLF(),
+    )
+
+    _emit_lora_chunk(
+        chunk_size=10,
+        chunk_success=8,
+        chunk_stages=["operating"] * 5 + ["construction"] * 3,
+        base_model_name="my-actual-base-model",
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["input"] == {"chunk_size": 10}
+    assert captured[0]["output"]["success_count"] == 8
+    assert captured[0]["output"]["stage_distribution"]["operating"] == 5
+    assert captured[0]["output"]["stage_distribution"]["construction"] == 3
+
+    assert captured[0]["metadata"]["model"] == "my-actual-base-model", (
+        "Langfuse metadata must emit the resolved base model, not BASE_MODEL constant"
+    )
+
+    # No per-row feature data must appear in the telemetry payload.
+    for col in _SENSITIVE_COLS | _IDENTIFIER_COLS:
+        assert col not in str(captured[0]), f"'{col}' must not appear in chunk telemetry"
+
+
+def test_emit_lora_chunk_uses_parent_trace_when_provided(monkeypatch) -> None:
+    """When parent_trace is given, generation must be emitted on it, not on the global client."""
+    from entity_data_lakehouse.ml_lora import _emit_lora_chunk
+
+    parent_captured: list[dict] = []
+    global_captured: list[dict] = []
+
+    class _FakeGen:
+        def end(self): pass
+
+    class _FakeParentTrace:
+        def generation(self, **kwargs):
+            parent_captured.append(kwargs)
+            return _FakeGen()
+
+    class _FakeGlobalLF:
+        def generation(self, **kwargs):
+            global_captured.append(kwargs)
+            return _FakeGen()
+
+    monkeypatch.setattr(
+        "entity_data_lakehouse.ml_lora.get_langfuse",
+        lambda: _FakeGlobalLF(),
+    )
+
+    parent_trace = _FakeParentTrace()
+
+    _emit_lora_chunk(5, 5, ["operating"] * 5, parent_trace=parent_trace)
+
+    assert len(parent_captured) == 1, "generation must be emitted on parent_trace"
+    assert len(global_captured) == 0, "global Langfuse client must NOT be called when parent_trace is set"

@@ -64,6 +64,7 @@ from sklearn.ensemble import (
 from sklearn.preprocessing import LabelEncoder
 
 from .contracts import validate_dataframe
+from .observability import get_langfuse
 
 logger = logging.getLogger(__name__)
 
@@ -623,104 +624,185 @@ def build_ml_predictions(
     """
     logger.info("Starting ML asset lifecycle extrapolation.")
 
-    # --- 1. Load reference data ---
-    country_attrs = _load_country_attributes(reference_root)
-    sector_params = _load_sector_lifecycle(reference_root)
-    logger.info(
-        "Loaded %d country attribute records and %d sector lifecycle profiles.",
-        len(country_attrs),
-        len(sector_params),
-    )
+    # Initialise Langfuse objects up-front but guard against any SDK/network
+    # error so telemetry failures can never abort pipeline execution.
+    # If setup fails, lf/span fall back to the no-op stubs from observability.py
+    # so every span.end() / lf.flush() call in except/finally is always valid.
+    try:
+        lf = get_langfuse()
+        trace = lf.trace(name="sklearn_build_ml_predictions")
+        span = trace.span(
+            name="build_ml_predictions",
+            input={
+                "asset_count": len(silver_outputs.get("asset_master", [])),
+                "seed": 42,
+                "backend": __import__("os").environ.get("ML_BACKEND", "sklearn"),
+            },
+        )
+    except Exception:
+        logger.debug("Langfuse setup failed; tracing disabled for this run.", exc_info=True)
+        from entity_data_lakehouse.observability import _NoOpLangfuse, _NoOpSpan, _NoOpTrace
+        lf = _NoOpLangfuse()
+        trace = _NoOpTrace()
+        span = _NoOpSpan()
 
-    # --- 2. Enrich real assets with geographic + lifecycle features ---
-    asset_master = silver_outputs["asset_master"]
-    ownership_lifecycle = gold_outputs.get("ownership_lifecycle", pd.DataFrame())
+    try:
+        # --- 1. Load reference data ---
+        country_attrs = _load_country_attributes(reference_root)
+        sector_params = _load_sector_lifecycle(reference_root)
+        logger.info(
+            "Loaded %d country attribute records and %d sector lifecycle profiles.",
+            len(country_attrs),
+            len(sector_params),
+        )
 
-    enriched = _enrich_asset_features(
-        asset_master, ownership_lifecycle, country_attrs, sector_params
-    )
-    logger.info(
-        "Enriched %d real assets with geographic and lifecycle features.", len(enriched)
-    )
+        # --- 2. Enrich real assets with geographic + lifecycle features ---
+        asset_master = silver_outputs["asset_master"]
+        ownership_lifecycle = gold_outputs.get("ownership_lifecycle", pd.DataFrame())
 
-    # --- 3. Generate synthetic training data ---
-    training_data = _generate_synthetic_training_data(
-        country_attrs=country_attrs,
-        sector_params=sector_params,
-        n_samples=300,
-        seed=42,
-    )
-    stage_dist = training_data["lifecycle_stage"].value_counts().to_dict()
-    logger.info(
-        "Generated %d synthetic training samples. Lifecycle stage distribution: %s",
-        len(training_data),
-        stage_dist,
-    )
+        enriched = _enrich_asset_features(
+            asset_master, ownership_lifecycle, country_attrs, sector_params
+        )
+        logger.info(
+            "Enriched %d real assets with geographic and lifecycle features.", len(enriched)
+        )
 
-    # --- 4. Train models ---
-    models, label_encoder = _train_models(training_data, seed=42)
+        # --- 3. Generate synthetic training data ---
+        training_data = _generate_synthetic_training_data(
+            country_attrs=country_attrs,
+            sector_params=sector_params,
+            n_samples=300,
+            seed=42,
+        )
+        stage_dist = training_data["lifecycle_stage"].value_counts().to_dict()
+        logger.info(
+            "Generated %d synthetic training samples. Lifecycle stage distribution: %s",
+            len(training_data),
+            stage_dist,
+        )
 
-    # --- 5. Predict for real assets ---
-    predictions = _predict_for_assets(enriched, models, label_encoder)
-    logger.info(
-        "Generated lifecycle predictions for %d assets. Stages: %s",
-        len(predictions),
-        predictions["predicted_lifecycle_stage"].value_counts().to_dict()
-        if not predictions.empty
-        else {},
-    )
+        # --- 4. Train models ---
+        models, label_encoder = _train_models(training_data, seed=42)
 
-    # --- 5a. Optional LoRA lifecycle-stage override ---
-    # When ML_BACKEND=lora is set and a trained adapter exists, override only
-    # predicted_lifecycle_stage and lifecycle_stage_confidence.  All other
-    # columns (retirement year, capacity factor, commissioning year, etc.)
-    # remain unchanged so the contract and integration-test row counts are
-    # not affected.
-    import os as _os
+        # --- 5. Predict for real assets ---
+        predictions = _predict_for_assets(enriched, models, label_encoder)
+        logger.info(
+            "Generated lifecycle predictions for %d assets. Stages: %s",
+            len(predictions),
+            predictions["predicted_lifecycle_stage"].value_counts().to_dict()
+            if not predictions.empty
+            else {},
+        )
 
-    _backend = _os.environ.get("ML_BACKEND")
-    if _backend == "lora":
-        _default_adapter = gold_root.parent / "models" / "lifecycle_lora_adapter"
-        _adapter_dir = Path(_os.environ.get("LORA_ADAPTER_PATH", str(_default_adapter)))
-        if _adapter_dir.exists():
-            from entity_data_lakehouse.ml_lora import predict_lifecycle_lora
+        # --- 5a. Optional LoRA lifecycle-stage override ---
+        # When ML_BACKEND=lora is set and a trained adapter exists, override only
+        # predicted_lifecycle_stage and lifecycle_stage_confidence.  All other
+        # columns (retirement year, capacity factor, commissioning year, etc.)
+        # remain unchanged so the contract and integration-test row counts are
+        # not affected.
+        import os as _os
 
-            if len(enriched) != len(predictions):
-                raise ValueError(
-                    f"LoRA override row mismatch: enriched={len(enriched)} "
-                    f"vs predictions={len(predictions)}"
+        _backend = _os.environ.get("ML_BACKEND")
+        if _backend == "lora":
+            _trusted_root = gold_root.parent / "models"
+            _default_adapter = _trusted_root / "lifecycle_lora_adapter"
+            _raw_adapter = Path(_os.environ.get("LORA_ADAPTER_PATH", str(_default_adapter)))
+            try:
+                from entity_data_lakehouse.ml_lora import validate_adapter_dir
+                _adapter_dir = validate_adapter_dir(_raw_adapter, _trusted_root)
+            except ValueError as _ve:
+                logger.warning(
+                    "ML_BACKEND=lora set but adapter path validation failed: %s; "
+                    "falling back to sklearn predictions.",
+                    _ve,
                 )
-            logger.info(
-                "ML_BACKEND=lora: overriding lifecycle stage column for %d assets "
-                "using adapter at %s.",
-                len(predictions),
-                _adapter_dir,
-            )
-            for i, (_, feat_row) in enumerate(enriched.iterrows()):
-                stage, conf = predict_lifecycle_lora(
-                    feat_row.to_dict(), adapter_dir=_adapter_dir
+            else:
+                from entity_data_lakehouse.ml_lora import predict_lifecycle_lora_batch
+
+                if len(enriched) != len(predictions):
+                    raise ValueError(
+                        f"LoRA override row mismatch: enriched={len(enriched)} "
+                        f"vs predictions={len(predictions)}"
+                    )
+                logger.info(
+                    "ML_BACKEND=lora: overriding lifecycle stage column for %d assets "
+                    "using adapter at %s.",
+                    len(predictions),
+                    _adapter_dir,
                 )
-                predictions.iat[
-                    i, predictions.columns.get_loc("predicted_lifecycle_stage")
-                ] = stage
-                predictions.iat[
-                    i, predictions.columns.get_loc("lifecycle_stage_confidence")
-                ] = conf
-            predictions["model_version"] = predictions["model_version"] + "+lora"
-        else:
-            logger.warning(
-                "ML_BACKEND=lora set but adapter not found at %s; "
-                "falling back to sklearn predictions.",
-                _adapter_dir,
+                batch_results = predict_lifecycle_lora_batch(
+                    enriched,
+                    adapter_dir=_adapter_dir,
+                    parent_trace=span,
+                )
+                if len(batch_results) != len(predictions):
+                    raise ValueError(
+                        f"LoRA batch returned {len(batch_results)} results for "
+                        f"{len(predictions)} rows — length mismatch."
+                    )
+                _lora_success_count = 0
+                _failed_indices: list[int] = []
+                for i, result in enumerate(batch_results):
+                    if result is None:
+                        _failed_indices.append(i)
+                        continue
+                    stage, conf = result
+                    predictions.iat[
+                        i, predictions.columns.get_loc("predicted_lifecycle_stage")
+                    ] = stage
+                    predictions.iat[
+                        i, predictions.columns.get_loc("lifecycle_stage_confidence")
+                    ] = conf
+                    predictions.iat[
+                        i, predictions.columns.get_loc("model_version")
+                    ] = predictions.iat[
+                        i, predictions.columns.get_loc("model_version")
+                    ] + "+lora"
+                    _lora_success_count += 1
+                if _failed_indices:
+                    _preview = _failed_indices[:5]
+                    logger.warning(
+                        "LoRA override: %d/%d rows failed (indices: %s%s); "
+                        "retained sklearn predictions.",
+                        len(_failed_indices),
+                        len(predictions),
+                        _preview,
+                        "..." if len(_failed_indices) > 5 else "",
+                    )
+
+        # --- 6. Validate against contract ---
+        validate_dataframe(predictions, contract_paths["asset_lifecycle_predictions"])
+
+        # --- 7. Write Parquet ---
+        dw_root = gold_root / "dw"
+        dw_root.mkdir(parents=True, exist_ok=True)
+        predictions.to_parquet(dw_root / "asset_lifecycle_predictions.parquet", index=False)
+        logger.info("Wrote asset_lifecycle_predictions.parquet to %s", dw_root)
+
+        try:
+            span.end(output={"prediction_rows": len(predictions)})
+        except Exception:
+            logger.debug("Langfuse span.end() failed on success path; ignoring.", exc_info=True)
+        return {"asset_lifecycle_predictions": predictions}
+
+    except Exception as _exc:
+        # End the span with error status so Langfuse captures failure cases.
+        # Any exception that reaches here is re-raised after telemetry cleanup.
+        try:
+            span.end(
+                output={"error": str(_exc)},
+                level="ERROR",
+                status_message=str(_exc),
             )
+        except Exception:
+            logger.debug("Langfuse span.end(error) failed; ignoring.", exc_info=True)
+        raise
 
-    # --- 6. Validate against contract ---
-    validate_dataframe(predictions, contract_paths["asset_lifecycle_predictions"])
-
-    # --- 7. Write Parquet ---
-    dw_root = gold_root / "dw"
-    dw_root.mkdir(parents=True, exist_ok=True)
-    predictions.to_parquet(dw_root / "asset_lifecycle_predictions.parquet", index=False)
-    logger.info("Wrote asset_lifecycle_predictions.parquet to %s", dw_root)
-
-    return {"asset_lifecycle_predictions": predictions}
+    finally:
+        # Always flush buffered telemetry — whether the pipeline succeeded or
+        # failed.  Without this, Langfuse traces for failed runs are silently
+        # discarded because the process exits before the background thread drains.
+        try:
+            lf.flush()
+        except Exception:
+            logger.debug("Langfuse flush() failed; ignoring.", exc_info=True)

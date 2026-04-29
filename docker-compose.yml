@@ -1,11 +1,57 @@
 services:
   lakehouse:
     build: .
+    environment:
+      USE_CLICKHOUSE: "${USE_CLICKHOUSE:-false}"
+      CLICKHOUSE_HOST: "${CLICKHOUSE_HOST:-clickhouse}"
+      CLICKHOUSE_PORT: "${CLICKHOUSE_PORT:-8123}"
+      CLICKHOUSE_DATABASE: "${CLICKHOUSE_DATABASE:-lakehouse}"
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-default}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-}"
+      # TLS — localhost compose network is trusted; enable for remote hosts.
+      CLICKHOUSE_SECURE: "${CLICKHOUSE_SECURE:-false}"
+      CLICKHOUSE_VERIFY: "${CLICKHOUSE_VERIFY:-true}"
+      # The compose-internal "clickhouse" hostname is not a loopback address,
+      # so the sink's plaintext guard requires this opt-in for the internal
+      # network.  The sink restricts the bypass to the literal "clickhouse"
+      # service name and RFC1918/ULA private addresses only — a public host
+      # cannot be bypassed even with this flag set.
+      # Default: false. Set to "true" in your .env when using the clickhouse profile.
+      CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK: "${CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK:-false}"
     volumes:
       - ./sample_data:/app/sample_data
       - ./bronze:/app/bronze
       - ./silver:/app/silver
       - ./gold:/app/gold
+    # When USE_CLICKHOUSE=true the sink runs inside the pipeline. Gate on the
+    # ClickHouse healthcheck so the pipeline does not start before the server
+    # is ready to accept connections.
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+        required: false   # no-op when --profile clickhouse is not active
+
+  # Optional ClickHouse analytics backend.
+  # Start with: USE_CLICKHOUSE=true docker compose --profile clickhouse up --build
+  clickhouse:
+    image: clickhouse/clickhouse-server:24-alpine
+    profiles:
+      - clickhouse
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
 
   airflow:
     build:
@@ -18,11 +64,31 @@ services:
       AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/repo/airflow/dags
       _AIRFLOW_DB_MIGRATE: "true"
       _AIRFLOW_WWW_USER_CREATE: "true"
-      _AIRFLOW_WWW_USER_USERNAME: admin
-      _AIRFLOW_WWW_USER_PASSWORD: admin
+      _AIRFLOW_WWW_USER_USERNAME: "${AIRFLOW_ADMIN_USER:-admin}"
+      # No default password — must be explicitly set via AIRFLOW_ADMIN_PASSWORD.
+      # See .env.example for guidance.
+      _AIRFLOW_WWW_USER_PASSWORD: "${AIRFLOW_ADMIN_PASSWORD:?Set AIRFLOW_ADMIN_PASSWORD in your .env file}"
       PYTHONPATH: /opt/airflow/repo/src
+      USE_CLICKHOUSE: "${USE_CLICKHOUSE:-false}"
+      CLICKHOUSE_HOST: "${CLICKHOUSE_HOST:-clickhouse}"
+      CLICKHOUSE_PORT: "${CLICKHOUSE_PORT:-8123}"
+      CLICKHOUSE_DATABASE: "${CLICKHOUSE_DATABASE:-lakehouse}"
+      CLICKHOUSE_USER: "${CLICKHOUSE_USER:-default}"
+      CLICKHOUSE_PASSWORD: "${CLICKHOUSE_PASSWORD:-}"
+      # TLS — localhost compose network is trusted; enable for remote hosts.
+      CLICKHOUSE_SECURE: "${CLICKHOUSE_SECURE:-false}"
+      CLICKHOUSE_VERIFY: "${CLICKHOUSE_VERIFY:-true}"
+      CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK: "${CLICKHOUSE_ALLOW_INSECURE_PRIVATE_NETWORK:-false}"
     volumes:
       - ./:/opt/airflow/repo
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+        required: false   # no-op when --profile clickhouse is not active
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:8793:8793"
     command: standalone
+
+volumes:
+  clickhouse_data:

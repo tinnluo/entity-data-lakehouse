@@ -40,6 +40,12 @@ search = [
   "fastapi>=0.111.0",
   "uvicorn>=0.29.0",
 ]
+clickhouse = [
+  "clickhouse-connect>=0.7.0",
+]
+observability = [
+  "langfuse>=2.0.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

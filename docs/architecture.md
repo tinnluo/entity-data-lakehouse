@@ -1,6 +1,59 @@
 # Architecture
 
-`entity-data-lakehouse` is a compact medallion-style demo for public entity and infrastructure data.
+`entity-data-lakehouse` is a public-safe reconstruction of a production-style entity and infrastructure lakehouse.
+The repo is designed to demonstrate layered contracts, optional production add-ons, and safe degradation: the default DuckDB path always works, while ClickHouse, LoRA, Airflow, hybrid search, and Langfuse remain opt-in.
+
+## System View
+
+```mermaid
+flowchart TD
+
+subgraph INPUTS["Inputs"]
+  direction LR
+  S["sample_data/<br/>public-safe CSV snapshots"]
+  R["reference_data/<br/>country + sector enrichment"]
+end
+
+subgraph PIPE["Lakehouse pipeline"]
+  direction TB
+  B["bronze/<br/>source envelopes + raw_payload"]
+  SI["silver/<br/>canonical entities, assets, ownership observations"]
+  ML["ML step<br/>sklearn baseline + optional LoRA override"]
+  G["gold/<br/>DuckDB + parquet warehouse outputs"]
+end
+
+subgraph EXT["Optional consumers and extensions"]
+  direction LR
+  D["dbt<br/>main_analytics.* models"]
+  HS["Hybrid search<br/>BM25 + vectors + RRF"]
+  CH["ClickHouse<br/>write-through sink"]
+  LF["Langfuse<br/>optional telemetry"]
+end
+
+  S --> B --> SI --> G
+  R --> ML
+  SI --> ML --> G
+  G --> D
+  G --> HS
+  G -. "USE_CLICKHOUSE=true" .-> CH
+  ML -. "LANGFUSE_* set" .-> LF
+
+  classDef bronze fill:#ffe6e6,stroke:#b30000,color:#111827,stroke-width:1.5px
+  classDef silver fill:#e6f0ff,stroke:#003399,color:#111827,stroke-width:1.5px
+  classDef golden fill:#e6ffe6,stroke:#006400,color:#111827,stroke-width:1.5px
+  classDef external fill:#fce8ff,stroke:#7b2fa8,color:#111827,stroke-width:1.5px,stroke-dasharray:6 4
+  classDef artifact fill:#fff8e1,stroke:#e65100,color:#111827,stroke-width:1.5px,stroke-dasharray:6 4
+
+  class S,B bronze
+  class SI,ML silver
+  class G golden
+  class R,CH,LF external
+  class D,HS artifact
+
+  style INPUTS fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
+  style PIPE fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
+  style EXT fill:none,stroke:#64748b,color:#cbd5e1,stroke-width:1px,stroke-dasharray:4 4
+```
 
 ## Flow
 
@@ -11,8 +64,10 @@
 2. `bronze/` receives a standardized envelope per source record with typed matching fields and a `raw_payload` JSON blob.
 3. `silver/` resolves canonical entities, standardizes asset dimensions, and emits both observation-grain tables and convenience outputs.
 4. `gold/` publishes a hybrid warehouse-oriented model and a local DuckDB database for ad hoc analysis.
-5. Optional hybrid search queries the current entity master with `bm25s`, sentence-transformer embeddings, local Qdrant persistence, and Reciprocal Rank Fusion.
-6. `ml/` (executed as the final pipeline step) enriches assets with geographic and economic features from `reference_data/`, trains three scikit-learn models on a synthetic reference dataset, and writes lifecycle predictions to `gold/dw/asset_lifecycle_predictions.parquet`.
+5. The ML step enriches assets with geographic and economic features from `reference_data/`, trains the sklearn baseline on synthetic reference data, and writes lifecycle predictions to `gold/dw/asset_lifecycle_predictions.parquet`.
+6. When `ML_BACKEND=lora`, the lifecycle-stage columns can be overridden by a constrained LoRA adapter while retirement year and capacity factor remain on sklearn.
+7. Optional hybrid search queries the current entity master with `bm25s`, sentence-transformer embeddings, local Qdrant persistence, and Reciprocal Rank Fusion.
+8. Optional ClickHouse writes the final DuckDB-backed analytics tables into a production-style OLAP sink.
 
 ## Entity Resolution
 
@@ -90,35 +145,140 @@ Airflow 2.9.
 
 ```bash
 docker compose build airflow
-docker compose up airflow     # UI at http://localhost:8080 (admin/admin)
+docker compose up airflow
 # or:
 make airflow-up
 ```
 
+UI: `http://localhost:8080`
+Login: `AIRFLOW_ADMIN_USER` / `AIRFLOW_ADMIN_PASSWORD` from `.env`
+
 See `airflow/README.md` for detailed local dev instructions.
 
-## LoRA Fine-Tuning Demo
+## Analytics Storage
 
-`ML_BACKEND=lora` activates an optional LoRA-tuned LLM path for the
-`predicted_lifecycle_stage` column only.  All other prediction columns
-(estimated_retirement_year, predicted_capacity_factor_pct, etc.) continue
-using the scikit-learn models unchanged.
+DuckDB is the primary analytics store and source of truth.  All queries,
+validation, and failure handling centre on DuckDB.  ClickHouse is an optional
+write-through sink — it receives the same rows already written to DuckDB and
+is intended for production-scale OLAP workloads.
+
+```text
+gold/entity_lakehouse.duckdb   ← primary store, always written
+        |
+        +--[USE_CLICKHOUSE=true]--> ClickHouse write-through sink
+                                    lakehouse.ownership_current
+                                    lakehouse.owner_infrastructure_exposure_snapshot
+                                    lakehouse.ml_asset_lifecycle_predictions
+```
+
+**DuckDB** — embedded, zero-infrastructure, suitable for local and CI use.
+Default path; `docker compose up --build` works without any extra flags.
+
+**ClickHouse** — optional MergeTree sink for production-style OLAP queries.
+Not a backend switch; DuckDB remains authoritative.
+
+```bash
+USE_CLICKHOUSE=true docker compose --profile clickhouse up --build
+# or:
+make clickhouse-up
+```
+
+The ClickHouse service is defined under the `clickhouse` compose profile so
+that `docker compose up --build` (default path) is completely unaffected.
+A healthcheck gates both the `lakehouse` and `airflow` services so the sink is
+ready before the first insert attempt.
+
+On startup the sink creates the target database if needed, then loads each table
+with atomic full-refresh semantics:
+
+- write rows into staging tables
+- swap staging and live tables with `EXCHANGE TABLES`
+- roll back already-swapped tables if a later refresh fails
+- publish the final `batch_id` to `lakehouse_batch_log` only after all three tables succeed
+
+Readers can pin to the latest successful batch by consulting `lakehouse_batch_log`,
+which avoids partially published snapshots.
+
+The DDL column sets in `clickhouse_sink.py` are derived directly from the gold
+output contracts.  If the DataFrame arriving at the sink has missing or extra
+columns relative to the declared contract, a `ValueError` is raised immediately —
+no silent fabrication of default values occurs.
+
+### Non-goals
+
+- No streaming / Kafka path — the pipeline is batch-oriented by design.
+- ClickHouse is not a replacement for bronze/silver/gold parquet files or DuckDB.
+- No schema migration tooling — DDL uses `CREATE DATABASE IF NOT EXISTS` and
+  `CREATE TABLE IF NOT EXISTS`; schema changes require a manual `DROP TABLE` or
+  `ALTER TABLE`, followed by a reload.
+
+## Observability
+
+When `LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are set, the pipeline emits
+traces and generation events to Langfuse:
+
+| Event | Source |
+|---|---|
+| `sklearn_build_ml_predictions` trace + `build_ml_predictions` span | `ml.py` — wraps the full baseline prediction step |
+| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` — chunk-level aggregate telemetry for LoRA inference |
+| `lora_training` trace + `train_lora_adapter` span | `scripts/train_lora.py` |
+| `eval_lora` trace | `scripts/eval_lora.py` |
+
+When credentials are absent, all Langfuse calls are no-ops (one warning on first use).
+Telemetry setup, `span.end()`, and `flush()` failures are intentionally non-fatal in both the pipeline and the training CLI.
+
+## Eval Harness
+
+`evals/run_evals.py` compares sklearn and LoRA on a held-out synthetic test set:
+
+```bash
+make eval
+```
+
+The report is written to `evals/output/latest_report.json`.  Schema:
+
+```json
+{
+  "report_timestamp": "...",
+  "test_samples": 60,
+  "sklearn_accuracy": 0.82,
+  "sklearn_f1_per_class": {...},
+  "sklearn_runtime_s": 0.4,
+  "lora_accuracy": null,
+  "lora_f1_per_class": null,
+  "lora_runtime_s": null,
+  "lora_available": false,
+  "schema_valid": true
+}
+```
+
+LoRA fields are `null` when the adapter has not been trained or the saved adapter fails validation.
 
 ### Design
 
 | Component | Description |
 |---|---|
-| `src/entity_data_lakehouse/ml_lora.py` | Lazy-import module: prompt construction, JSONL generation, adapter training, inference |
-| `scripts/train_lora.py` | CLI to generate synthetic JSONL + fine-tune the adapter |
+| `src/entity_data_lakehouse/ml.py` | Baseline sklearn training/inference, optional LoRA override wiring, fallback-to-sklearn behavior |
+| `src/entity_data_lakehouse/ml_lora.py` | Prompt construction, JSONL generation, constrained adapter training, validated loading, teacher-forced inference |
+| `scripts/train_lora.py` | CLI to generate synthetic JSONL and fine-tune the adapter on the pinned base model + revision |
 | `scripts/eval_lora.py` | Accuracy / F1 / confusion matrix: LoRA vs sklearn baseline |
-| `models/lifecycle_lora_adapter/` | Saved PEFT adapter weights (gitignored) |
+| `models/lifecycle_lora_adapter/` | Saved PEFT adapter weights plus `adapter_metadata.json` provenance |
 
 Base model: `Qwen/Qwen2.5-0.5B-Instruct`
+Pinned default revision: `BASE_MODEL_REVISION` in `ml_lora.py` (overrideable via `LORA_BASE_MODEL_REVISION` or `scripts/train_lora.py --revision`)
 
 ### Adapter path resolution
 
 The adapter directory is resolved from `gold_root.parent / "models" / "lifecycle_lora_adapter"`,
-or overridden via `LORA_ADAPTER_PATH`.  CWD-relative paths are never used.
+or overridden via `LORA_ADAPTER_PATH`.
+
+Guardrails:
+
+- the resolved path must remain under the trusted `models/` root
+- symlink escape and `..` escape are rejected
+- the path must be a directory
+- `adapter_metadata.json` is required and must contain the exact training revision
+- the adapter base model must match the pinned `BASE_MODEL`
 
 ### Usage
 
@@ -127,6 +287,9 @@ pip install -e '.[lora]'
 
 # 1. Train the adapter (~5 min on MPS / GPU):
 python scripts/train_lora.py --samples 200 --epochs 1
+
+# Optional: train against an explicit revision override:
+python scripts/train_lora.py --samples 200 --epochs 1 --revision "$LORA_BASE_MODEL_REVISION"
 
 # 2. Optional: evaluate vs sklearn baseline:
 python scripts/eval_lora.py
@@ -138,3 +301,11 @@ ML_BACKEND=lora python scripts/run_pipeline.py
 When `ML_BACKEND` is unset (default), `ml_lora` is never imported and behaviour
 is identical to the pre-LoRA baseline.  Integration-test row counts are not
 affected: `ml=5` holds regardless of backend.
+
+### Runtime behavior
+
+- LoRA overrides only `predicted_lifecycle_stage` and `lifecycle_stage_confidence`
+- the scoring method is teacher-forced log-probability over the full candidate label sequence
+- batched chunk inference is used for throughput
+- if a chunk fails, the runtime retries each row individually so healthy rows still get LoRA predictions
+- rows that still fail fall back to the precomputed sklearn outputs

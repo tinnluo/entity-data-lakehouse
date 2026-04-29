@@ -7,6 +7,10 @@ python scripts/eval_lora.py [--adapter DIR] [--samples N] [--test-split F]
 Prints accuracy, per-class F1, and a confusion matrix for both the LoRA
 adapter and the sklearn RandomForestClassifier on a held-out synthetic split.
 
+When Langfuse credentials are configured (LANGFUSE_PUBLIC_KEY /
+LANGFUSE_SECRET_KEY), each LoRA inference call emits a generation span via
+the observability module.
+
 Requires the [lora] optional dependency group:
     pip install -e '.[lora]'
 """
@@ -31,35 +35,21 @@ from entity_data_lakehouse.ml import (  # noqa: E402
 from entity_data_lakehouse.ml_lora import (  # noqa: E402
     DEFAULT_ADAPTER_REL,
     LIFECYCLE_STAGES,
-    features_to_prompt,
-    load_lora_model,
+    predict_lifecycle_lora,
 )
+from entity_data_lakehouse.observability import get_langfuse  # noqa: E402
 
 
-def _predict_lora_batch(rows, adapter_dir: Path) -> list[str]:
-    """Run LoRA inference row-by-row and return predicted stage labels."""
-    import torch
+def _predict_lora_batch(rows: list[dict], adapter_dir: Path) -> list[str]:
+    """Run LoRA inference row-by-row and return predicted stage labels.
 
-    model, tokenizer = load_lora_model(str(adapter_dir))
+    Uses predict_lifecycle_lora (softmax over 5 labels) for each row.
+    Langfuse generation spans are emitted automatically by predict_lifecycle_lora
+    when credentials are configured.
+    """
     predictions = []
     for feat_dict in rows:
-        prompt = features_to_prompt(feat_dict)
-        inputs = tokenizer(prompt, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=8,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-            )
-        generated = (
-            tokenizer.decode(
-                outputs[0][inputs["input_ids"].shape[1] :], skip_special_tokens=True
-            )
-            .strip()
-            .lower()
-        )
-        stage = next((s for s in LIFECYCLE_STAGES if s in generated), "operating")
+        stage, _conf = predict_lifecycle_lora(feat_dict, adapter_dir=adapter_dir)
         predictions.append(stage)
     return predictions
 
@@ -94,6 +84,9 @@ def main() -> None:
         print(f"Adapter not found at {args.adapter}. Run train_lora.py first.")
         sys.exit(1)
 
+    lf = get_langfuse()
+    trace = lf.trace(name="lora_eval")
+
     reference_root = _REPO_ROOT / "reference_data"
     country_attrs = _load_country_attributes(reference_root)
     sector_params = _load_sector_lifecycle(reference_root)
@@ -112,30 +105,31 @@ def main() -> None:
 
     # --- sklearn baseline ---
     print("Training sklearn baseline ...")
-    le = LabelEncoder()
-    le.fit(LIFECYCLE_STAGES)
     models, _ = _train_models(train_df, seed=42)
     X_test = test_df[_FEATURE_COLS].values
     y_true = test_df["lifecycle_stage"].tolist()
 
     sk_pred_encoded = models["lifecycle_stage_clf"].predict(X_test)
-    # _train_models uses its own LabelEncoder internally; decode via a fresh one
-    # trained on the training split labels.
     le2 = LabelEncoder()
     le2.fit(train_df["lifecycle_stage"])
     sk_pred = le2.inverse_transform(sk_pred_encoded)
 
+    sk_acc = accuracy_score(y_true, sk_pred)
     print("\n=== sklearn RandomForest ===")
-    print(f"Accuracy: {accuracy_score(y_true, sk_pred):.3f}")
+    print(f"Accuracy: {sk_acc:.3f}")
     print(
         classification_report(y_true, sk_pred, labels=LIFECYCLE_STAGES, zero_division=0)
     )
+
+    # Log sklearn score to Langfuse trace.
+    trace.score(name="sklearn_accuracy", value=float(sk_acc))
 
     # --- LoRA ---
     print(f"\n=== LoRA adapter ({args.adapter}) ===")
     test_rows = [row.to_dict() for _, row in test_df.iterrows()]
     lora_pred = _predict_lora_batch(test_rows, args.adapter)
-    print(f"Accuracy: {accuracy_score(y_true, lora_pred):.3f}")
+    lora_acc = accuracy_score(y_true, lora_pred)
+    print(f"Accuracy: {lora_acc:.3f}")
     print(
         classification_report(
             y_true, lora_pred, labels=LIFECYCLE_STAGES, zero_division=0
@@ -147,6 +141,9 @@ def main() -> None:
     print("Confusion matrix (LoRA):")
     print(f"Labels: {LIFECYCLE_STAGES}")
     print(cm)
+
+    trace.score(name="lora_accuracy", value=float(lora_acc))
+    lf.flush()
 
 
 if __name__ == "__main__":

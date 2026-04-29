@@ -59,6 +59,13 @@ def run_pipeline(repo_root: Path) -> dict[str, int]:
         },
     )
 
+    # Safety gate: run BEFORE build_ml_predictions so that even Langfuse/off-box
+    # telemetry emitted during inference never fires when the scan would fail.
+    # Parquet/DuckDB files written so far are local-only and are not sent anywhere.
+    safety_findings = scan_public_safety(repo_root)
+    if safety_findings:
+        raise ValueError("Public-safety scan failed:\n" + "\n".join(safety_findings))
+
     # ML extrapolation: train on synthetic reference data, predict for real assets.
     ml_outputs = build_ml_predictions(
         gold_root=repo_root / "gold",
@@ -81,9 +88,10 @@ def run_pipeline(repo_root: Path) -> dict[str, int]:
     con.close()
     logger.info("Registered ML predictions in DuckDB: %d rows.", len(ml_predictions))
 
-    safety_findings = scan_public_safety(repo_root)
-    if safety_findings:
-        raise ValueError("Public-safety scan failed:\n" + "\n".join(safety_findings))
+    # Optional ClickHouse sink — no-ops unless USE_CLICKHOUSE=true.
+    from .clickhouse_sink import write_gold_to_clickhouse
+
+    write_gold_to_clickhouse(gold_outputs, ml_outputs)
 
     return {
         "entity_master_rows": len(silver_outputs["entity_master"]),
