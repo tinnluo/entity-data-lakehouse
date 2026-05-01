@@ -220,9 +220,10 @@ traces and generation events to Langfuse:
 | Event | Source |
 |---|---|
 | `sklearn_build_ml_predictions` trace + `build_ml_predictions` span | `ml.py` — wraps the full baseline prediction step |
-| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` — chunk-level aggregate telemetry for LoRA inference |
+| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` — chunk-level aggregate telemetry: runtime, attempted/successful throughput, cost proxy, USD estimate |
 | `lora_training` trace + `train_lora_adapter` span | `scripts/train_lora.py` |
 | `eval_lora` trace | `scripts/eval_lora.py` |
+| `evals_run` trace + scores | `evals/run_evals.py` — accuracy scores, runtime/cost benchmark metadata, pricing profile |
 
 When credentials are absent, all Langfuse calls are no-ops (one warning on first use).
 Telemetry setup, `span.end()`, and `flush()` failures are intentionally non-fatal in both the pipeline and the training CLI.
@@ -237,12 +238,14 @@ make eval
 
 The report is written to `evals/output/latest_report.json`.  The harness is
 **runtime- and cost-aware**: `*_runtime_s` fields measure inference time,
-training time is reported separately, and cost fields use an equivalent-cloud
-rate card.  Schema (abbreviated — see `evals/output/latest_report.json` for
-the full current output):
+training time is reported separately in `*_training_runtime_s`, and cost
+fields use an equivalent-cloud rate card.  The report is nested into
+`sklearn`, `lora`, and `comparison` sub-dicts.  Schema (abbreviated —
+see `evals/output/latest_report.json` for the full current output):
 
 ```json
 {
+  "schema_version": "2",
   "report_timestamp": "...",
   "test_samples": 60,
   "cost_estimate_method": "equivalent_cloud_rate_card",
@@ -252,36 +255,51 @@ the full current output):
     "lora_train_usd_per_hour": 1.00,
     "lora_infer_usd_per_hour": 1.00,
     "lora_amortization_samples": 10000,
-    "notes": "Equivalent benchmark rates for local runs; not actual billed cloud cost."
+    "notes": "Equivalent benchmark rates for local runs; not actual billed cloud cost.",
+    "stored_pricing_profile": null,
+    "stored_pricing_notes": null
   },
   "cost_proxy_unit": "compute_seconds",
-  "sklearn_accuracy": 0.82,
-  "sklearn_f1_per_class": {...},
-  "sklearn_training_runtime_s": 1.0,
-  "sklearn_runtime_s": 0.4,
-  "sklearn_training_estimated_cost_usd": 0.00006,
-  "sklearn_estimated_cost_usd": 0.000002,
-  "sklearn_cost_per_sample_usd": 0.000001,
-  "lora_accuracy": null,
-  "lora_f1_per_class": null,
-  "lora_training_runtime_s": null,
-  "lora_runtime_s": null,
-  "lora_estimated_cost_usd": null,
-  "lora_cost_per_sample_usd": null,
-  "lora_amortized_cost_per_sample_usd": null,
-  "lora_available": false,
-  "accuracy_delta_lora_minus_sklearn": null,
-  "runtime_ratio_lora_to_sklearn": null,
-  "cost_ratio_lora_to_sklearn": null,
+  "sklearn": {
+    "accuracy": 0.82,
+    "f1_per_class": {"...": "..."},
+    "training_runtime_s": 1.0,
+    "runtime_s": 0.4,
+    "training_estimated_cost_usd": 0.00006,
+    "estimated_cost_usd": 0.000002,
+    "cost_per_sample_usd": 0.000001
+  },
+  "lora": {
+    "adapter_present": false,
+    "available": false,
+    "inference_healthy": null,
+    "model_load_s": null,
+    "runtime_s": null,
+    "training_runtime_s": null,
+    "estimated_cost_usd": null,
+    "cost_per_sample_usd": null,
+    "amortized_cost_per_sample_usd": null,
+    "effective_train_usd_per_hour": null,
+    "..."
+  },
+  "comparison": {
+    "accuracy_delta_lora_minus_sklearn": null,
+    "runtime_ratio_lora_to_sklearn": null,
+    "cost_ratio_lora_to_sklearn": null
+  },
   "quality_latency_tradeoff_summary": "...",
   "schema_valid": true
 }
 ```
 
-LoRA fields are `null` when the adapter has not been trained or the saved
-adapter fails validation.  USD values are **estimates derived from a declared
-rate card**, not actual billed cloud cost.  The rate card defaults can be
-overridden via environment variables (see `.env.example`).
+Key report semantics:
+
+- `lora.model_load_s` — adapter and tokenizer load time, split from pure inference so `lora.runtime_s` is directly comparable to sklearn timing.
+- `comparison.*_ratio` fields are `null` when `lora.available` is `false`.
+- `pricing_assumptions.stored_pricing_profile` / `stored_pricing_notes` — rate-card provenance recovered from the adapter's `adapter_metadata.json` at training time; `null` when no adapter is present.
+- USD values are **estimates derived from a declared rate card**, not actual billed cloud cost.
+
+Rate-card defaults can be overridden via environment variables (see `.env.example`).
 
 ### Design
 

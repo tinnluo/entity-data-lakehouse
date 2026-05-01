@@ -323,12 +323,17 @@ make eval
 python evals/run_evals.py
 ```
 
-The report is written to `evals/output/latest_report.json` and includes accuracy,
-per-class F1, **runtime split by training and inference**, **cost proxies**, and
-**equivalent-cloud USD estimates** for both backends. The `*_runtime_s` fields
-measure inference time; training time is reported separately in
-`*_training_runtime_s`. USD values are estimates from a declared rate card, not
-actual billed cost. The LoRA entry is skipped gracefully if the adapter has not
+The report is written to `evals/output/latest_report.json` and includes
+`schema_version`, accuracy, per-class F1, **runtime split by training and
+inference**, **cost proxies**, and **equivalent-cloud USD estimates** for
+both backends — structured into nested `sklearn`, `lora`, and `comparison`
+sub-dicts. The `lora` section includes `model_load_s` (adapter load time,
+split from pure inference) and `effective_train_usd_per_hour` (recovered
+from adapter provenance so historical reports are not affected by later
+env-var changes). Comparison ratio fields (`runtime_ratio_lora_to_sklearn`,
+`cost_ratio_lora_to_sklearn`) are `null` when the LoRA adapter is
+unavailable. USD values are estimates from a declared rate card, not actual
+billed cost. The LoRA entry is skipped gracefully if the adapter has not
 been trained or fails validation.
 
 Rate-card defaults can be overridden via environment variables (see `.env.example`).
@@ -416,7 +421,7 @@ Current telemetry surface:
 | Event | Source | Cost/Runtime metadata |
 |---|---|---|
 | `sklearn_build_ml_predictions` trace + `build_ml_predictions` span | `ml.py` | Backend, pricing profile |
-| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` | Chunk runtime, throughput, cost proxy, USD estimate |
+| `lifecycle_lora_batch_chunk` generation | `ml_lora.py` | Chunk runtime, attempted/successful throughput, cost proxy, USD estimate |
 | `lora_training` trace + `train_lora_adapter` span | `scripts/train_lora.py` | Training runtime, USD estimate, pricing profile |
 | `evals_run` trace | `evals/run_evals.py` | Accuracy scores + runtime/cost benchmark metadata |
 
