@@ -32,6 +32,7 @@ Entity and ownership data tends to arrive from multiple sources, at different gr
 | Derived exposure mart | Publishes a denormalized owner-to-asset exposure snapshot for analytics consumption. |
 | DuckDB-first analytics store | Keeps the default path local, deterministic, and infrastructure-free. |
 | ML enrichment | Adds lifecycle-stage, retirement-year, and capacity-factor predictions from a reproducible sklearn baseline. |
+| Rollback-safe analytics publication | Every run emits a machine-readable `publish_report.json` with row counts, rollback status, and sink summary. `publish_mode=dry_run` validates the full pipeline and ClickHouse schemas without writing any artifacts (except the report itself). `publish_mode=commit` (default) is the full pipeline with all writes and optional ClickHouse sink. |
 | Runtime- and cost-aware benchmarking | The eval harness reports quality, latency, and equivalent-cloud cost estimates for sklearn vs LoRA in a single reproducible JSON report. |
 | Optional LoRA override | Allows lifecycle-stage override only, while preserving the sklearn baseline for the other prediction columns. |
 | Optional extension surfaces | dbt, Airflow, ClickHouse, hybrid search, and Langfuse can be enabled without changing the default DuckDB pipeline. |

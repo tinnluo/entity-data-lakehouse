@@ -264,7 +264,7 @@ a run's publication outcome.
     "clickhouse_enabled": true,
     "tables_refreshed": ["..."],
     "batch_id": "...",
-    "status": "success | skipped | failed | dry_run_validated | dry_run_schema_failed",
+    "status": "success | skipped | not_started | failed | dry_run_validated | dry_run_schema_failed",
     "schema_validations": [{"table": "...", "status": "passed", "error": null}]
   },
   "public_safety": {"status": "passed", "findings": []},
