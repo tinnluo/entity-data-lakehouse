@@ -39,6 +39,8 @@ def ingest_sample_data(
     sample_root: Path,
     bronze_root: Path,
     contract_path: Path,
+    *,
+    dry_run: bool = False,
 ) -> dict[tuple[str, str], pd.DataFrame]:
     bronze_frames: dict[tuple[str, str], pd.DataFrame] = {}
     for source_dir in sorted(path for path in sample_root.iterdir() if path.is_dir()):
@@ -59,8 +61,9 @@ def ingest_sample_data(
 
             validate_dataframe(bronze_df, contract_path)
 
-            output_dir = bronze_root / f"source={source_name}" / f"snapshot_date={snapshot_date}"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            bronze_df.to_parquet(output_dir / "records.parquet", index=False)
+            if not dry_run:
+                output_dir = bronze_root / f"source={source_name}" / f"snapshot_date={snapshot_date}"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                bronze_df.to_parquet(output_dir / "records.parquet", index=False)
             bronze_frames[(source_name, snapshot_date)] = bronze_df
     return bronze_frames

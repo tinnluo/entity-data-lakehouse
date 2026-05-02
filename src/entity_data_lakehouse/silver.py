@@ -428,6 +428,8 @@ def build_silver_outputs(
     sample_root: Path,
     silver_root: Path,
     contract_paths: dict[str, Path],
+    *,
+    dry_run: bool = False,
 ) -> dict[str, pd.DataFrame]:
     registry_df, infra_df, hierarchy_df = _load_snapshot_frames(sample_root)
     observations = _collect_entity_observations(registry_df, infra_df, hierarchy_df)
@@ -444,8 +446,10 @@ def build_silver_outputs(
         "relationship_edges": relationship_edges,
     }
 
-    silver_root.mkdir(parents=True, exist_ok=True)
+    if not dry_run:
+        silver_root.mkdir(parents=True, exist_ok=True)
     for name, frame in outputs.items():
         validate_dataframe(frame, contract_paths[name])
-        frame.to_parquet(silver_root / f"{name}.parquet", index=False)
+        if not dry_run:
+            frame.to_parquet(silver_root / f"{name}.parquet", index=False)
     return outputs

@@ -19,9 +19,9 @@ run_pipeline_stages  >>  run_dbt  >>  run_public_safety_scan
 
 | Task | Operator | Purpose |
 |---|---|---|
-| `run_pipeline_stages` | `PythonOperator` | Calls `run_pipeline(repo_root)` to execute bronze -> silver -> gold -> ML |
-| `run_dbt` | `BashOperator` | Runs `dbt run` and `dbt test` against the DuckDB-backed gold outputs |
-| `run_public_safety_scan` | `BashOperator` | Runs `scripts/verify_public_safety.py` as the final gate |
+| `run_pipeline_stages` | `PythonOperator` | Calls `run_pipeline(repo_root, publish_mode=PUBLISH_MODE)` to execute bronze -> silver -> gold -> ML and emit `publish_report.json` |
+| `run_dbt` | `PythonOperator` | Runs `dbt run` and `dbt test` in `commit` mode; returns early with a skip message in `dry_run` (no gold artefacts to materialise) |
+| `run_public_safety_scan` | `BashOperator` | Runs `scripts/verify_public_safety.py` as the final gate (both modes) |
 
 Important design point: the DAG does not implement a second copy of pipeline logic. It orchestrates the same Python pipeline and dbt project used elsewhere in the repo.
 
@@ -85,6 +85,40 @@ make airflow-down
 - dbt runs against the same `gold/entity_lakehouse.duckdb` file produced by the pipeline task
 
 ## Optional Features During Airflow Runs
+
+### Publish Mode
+
+The DAG reads `PUBLISH_MODE` to control safe batch publication:
+
+| Value | Behaviour |
+|---|---|
+| `commit` (default) | Full pipeline with all disk writes and optional ClickHouse sink, followed by dbt run/test and public-safety scan |
+| `dry_run` | Validates the full pipeline and ClickHouse schemas; writes only `publish_report.json` (and creates its parent directory if absent). The `run_dbt` task runs but returns early (no dbt execution — no gold artefacts are written, so dbt has nothing to materialise). The `run_public_safety_scan` task still runs. |
+
+**Set via Airflow Variable (recommended — controllable from the UI):**
+
+```bash
+# In the Airflow UI: Admin → Variables → Add
+# Key: PUBLISH_MODE   Value: dry_run
+```
+
+Or via CLI:
+
+```bash
+docker compose exec airflow airflow variables set PUBLISH_MODE dry_run
+```
+
+**Set via environment variable (fallback):**
+
+```bash
+PUBLISH_MODE=dry_run docker compose up airflow
+```
+
+When neither is set, the DAG defaults to `commit`.
+
+The `publish_report.json` artifact is written to `gold/publish_report.json` after every run (both modes) and is accessible on the host via the bind-mounted repo directory.
+
+> **Note:** In `dry_run` mode the `run_dbt` task (`PythonOperator`) returns early without invoking dbt rather than running `dbt run`. This is intentional — dbt requires the gold DuckDB file and parquet outputs that `dry_run` deliberately does not produce.
 
 ### ClickHouse
 

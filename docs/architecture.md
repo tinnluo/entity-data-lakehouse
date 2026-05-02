@@ -3,6 +3,11 @@
 `entity-data-lakehouse` is a public-safe reconstruction of a production-style entity and infrastructure lakehouse.
 The repo is designed to demonstrate layered contracts, optional production add-ons, and safe degradation: the default DuckDB path always works, while ClickHouse, LoRA, Airflow, hybrid search, and Langfuse remain opt-in.
 
+The repo demonstrates two distinct workload properties:
+
+- **ML quality / latency / cost benchmarking** — sklearn baseline vs optional LoRA adapter with runtime and equivalent-cloud USD estimates
+- **Rollback-safe analytics publication** — `publish_mode=dry_run|commit` with a machine-readable `publish_report.json` artifact covering row counts, rollback status, and sink target summary
+
 ## System View
 
 ```mermaid
@@ -133,9 +138,13 @@ run_pipeline_stages  >>  run_dbt  >>  run_public_safety_scan
 
 | Task | Type | Action |
 |---|---|---|
-| `run_pipeline_stages` | PythonOperator | Calls `run_pipeline(repo_root)` — bronze → silver → gold → ML |
-| `run_dbt` | BashOperator | `dbt run --profiles-dir . && dbt test --profiles-dir .` |
-| `run_public_safety_scan` | BashOperator | `python verify_public_safety.py` |
+| `run_pipeline_stages` | PythonOperator | Calls `run_pipeline(repo_root, publish_mode=PUBLISH_MODE)` — bronze → silver → gold → ML |
+| `run_dbt` | PythonOperator | `commit`: `dbt run && dbt test`; `dry_run`: returns early (no dbt execution — no gold artefacts to materialise) |
+| `run_public_safety_scan` | BashOperator | `python verify_public_safety.py` (both modes) |
+
+`PUBLISH_MODE` is read from the Airflow Variable `PUBLISH_MODE` (set via Airflow UI or
+API), falling back to the `PUBLISH_MODE` environment variable, and then to `"commit"`.
+See `airflow/README.md` for details.
 
 The DAG uses `schedule=None` (manual trigger) and runs with `SequentialExecutor` +
 SQLite, which is the recommended configuration for single-machine demo deployments of
@@ -160,10 +169,12 @@ See `airflow/README.md` for detailed local dev instructions.
 DuckDB is the primary analytics store and source of truth.  All queries,
 validation, and failure handling centre on DuckDB.  ClickHouse is an optional
 write-through sink — it receives the same rows already written to DuckDB and
-is intended for production-scale OLAP workloads.
+is intended for production-scale OLAP workloads.  This is a
+**DuckDB-authoritative, ClickHouse-optional** architecture; ClickHouse is not a
+backend switch and does not replace DuckDB.
 
 ```text
-gold/entity_lakehouse.duckdb   ← primary store, always written
+gold/entity_lakehouse.duckdb   ← primary store (always written in commit mode)
         |
         +--[USE_CLICKHOUSE=true]--> ClickHouse write-through sink
                                     lakehouse.ownership_current
@@ -211,6 +222,64 @@ no silent fabrication of default values occurs.
 - No schema migration tooling — DDL uses `CREATE DATABASE IF NOT EXISTS` and
   `CREATE TABLE IF NOT EXISTS`; schema changes require a manual `DROP TABLE` or
   `ALTER TABLE`, followed by a reload.
+
+## Safe Batch Publication
+
+Every pipeline run emits `gold/publish_report.json` (or a custom path via
+`--report-path`).  The report is the authoritative machine-readable artifact for
+a run's publication outcome.
+
+### `publish_mode=dry_run`
+
+- All computation (bronze → silver → gold → ML) runs identically.
+- All contract validations run (`validate_dataframe`, `scan_public_safety`).
+- ClickHouse sink schemas are validated via `validate_sink_schema()` without connecting.
+- **Minimal disk writes**: no parquet, no DuckDB, no ClickHouse mutations.
+- The only file written is `publish_report.json` (its parent directory is created if it does not already exist).
+- Useful for CI preflight, demo review, and pre-publish checks.
+
+> **Airflow note:** when triggered via the Airflow DAG, `dry_run` additionally causes the
+> `run_dbt` task to return early (no dbt execution) because dbt requires the gold DuckDB file and parquet outputs that
+> `dry_run` intentionally does not produce.  The `run_public_safety_scan` task still runs.
+
+### `publish_mode=commit` (default)
+
+- Full pipeline with all disk writes and optional ClickHouse sink.
+- Behaviour is identical to the pre-publish-mode baseline.
+- `publish_report.json` is written alongside normal artifacts.
+
+### `publish_report.json` schema
+
+```json
+{
+  "schema_version": "1",
+  "report_timestamp": "2026-...",
+  "run_id": "<uuid12>",
+  "publish_mode": "dry_run | commit",
+  "status": "success | failed",
+  "tables_attempted": ["ownership_current", "owner_infrastructure_exposure_snapshot", "ml_asset_lifecycle_predictions"],
+  "row_counts": {"entity_master_rows": 6, "asset_master_rows": 5, "...": "..."},
+  "rollback_status": "not_applicable | clean | rolled_back | partial_rollback_failed",
+  "sink_target": {
+    "clickhouse_enabled": true,
+    "tables_refreshed": ["..."],
+    "batch_id": "...",
+    "status": "success | skipped | failed | dry_run_validated | dry_run_schema_failed",
+    "schema_validations": [{"table": "...", "status": "passed", "error": null}]
+  },
+  "public_safety": {"status": "passed", "findings": []},
+  "artifacts_written": ["gold/dw/ownership_current.parquet", "..."]  // gold artefacts only; empty in dry_run
+}
+```
+
+`rollback_status` transitions:
+
+| Value | Meaning |
+|---|---|
+| `not_applicable` | ClickHouse disabled; no rollback needed |
+| `clean` | All tables refreshed successfully; old staging tables dropped |
+| `rolled_back` | Partial failure; already-swapped tables were re-exchanged back to prior live data |
+| `partial_rollback_failed` | Partial failure and at least one rollback exchange also failed; manual recovery needed |
 
 ## Observability
 

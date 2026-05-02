@@ -45,8 +45,9 @@ Per asset, the feature vector combines:
 Outputs
 -------
 ``gold/dw/asset_lifecycle_predictions.parquet`` — one row per asset, all
-prediction outputs plus the feature inputs for full explainability.  Also
-written to ``gold/entity_lakehouse.duckdb`` as ``ml_asset_lifecycle_predictions``.
+prediction outputs plus the feature inputs for full explainability.  The
+DuckDB registration of ``ml_asset_lifecycle_predictions`` is performed by
+``pipeline.py`` after ``build_ml_predictions()`` returns, not by this module.
 """
 
 from __future__ import annotations
@@ -604,6 +605,8 @@ def build_ml_predictions(
     gold_outputs: dict[str, pd.DataFrame],
     reference_root: Path,
     contract_paths: dict[str, Path],
+    *,
+    dry_run: bool = False,
 ) -> dict[str, pd.DataFrame]:
     """Orchestrate the full ML extrapolation pipeline.
 
@@ -616,11 +619,21 @@ def build_ml_predictions(
       4. Train three models on the synthetic data.
       5. Run inference against the real enriched assets.
       6. Validate the output against the contract schema.
-      7. Write ``gold/dw/asset_lifecycle_predictions.parquet`` and register
-         in DuckDB.
+      7. Write ``gold/dw/asset_lifecycle_predictions.parquet`` (skipped when
+         ``dry_run=True``).  DuckDB registration of the predictions table is
+         handled by ``pipeline.py`` after this function returns.
 
     Returns a dict containing the predictions DataFrame under the key
     ``"asset_lifecycle_predictions"``.
+
+    Parameters
+    ----------
+    dry_run:
+        When ``True``, all computation and validation run identically but no
+        parquet files are written.  (DuckDB registration is always handled by
+        ``pipeline.py``, not here.)  Langfuse telemetry traces are still emitted
+        if credentials are configured — telemetry is an out-of-band side effect
+        and does not affect pipeline artefacts.
     """
     logger.info("Starting ML asset lifecycle extrapolation.")
 
@@ -774,10 +787,11 @@ def build_ml_predictions(
         validate_dataframe(predictions, contract_paths["asset_lifecycle_predictions"])
 
         # --- 7. Write Parquet ---
-        dw_root = gold_root / "dw"
-        dw_root.mkdir(parents=True, exist_ok=True)
-        predictions.to_parquet(dw_root / "asset_lifecycle_predictions.parquet", index=False)
-        logger.info("Wrote asset_lifecycle_predictions.parquet to %s", dw_root)
+        if not dry_run:
+            dw_root = gold_root / "dw"
+            dw_root.mkdir(parents=True, exist_ok=True)
+            predictions.to_parquet(dw_root / "asset_lifecycle_predictions.parquet", index=False)
+            logger.info("Wrote asset_lifecycle_predictions.parquet to %s", dw_root)
 
         try:
             from .benchmark_costs import load_pricing as _load_pricing

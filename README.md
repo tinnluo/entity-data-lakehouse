@@ -9,8 +9,10 @@ The interesting part is not dataset size. The interesting part is the contract a
 |---|---|
 | Bronze -> silver -> gold discipline | The repo demonstrates contract-driven staging instead of one-shot transformation scripts. |
 | Hybrid warehouse outputs | Entity and ownership history are modeled with both SCD4 and SCD2 patterns so consumers can choose full observational fidelity or stable current/history tables. |
-| Default-local, optional-production shape | DuckDB remains authoritative, while dbt, Airflow, ClickHouse, search, LoRA, and Langfuse are all explicit opt-ins. |
+| Rollback-safe analytics publication | Every pipeline run emits a machine-readable `publish_report.json` with row counts, rollback status, and sink target summary. A `dry_run` mode validates the full pipeline and ClickHouse schemas without mutating any sink. |
+| DuckDB-authoritative, ClickHouse-optional shape | DuckDB remains authoritative, while dbt, Airflow, ClickHouse, search, LoRA, and Langfuse are all explicit opt-ins. |
 | Safe ML extension path | The sklearn baseline remains the default; the LoRA path is constrained, revision-pinned, trusted-root validated, and falls back cleanly when unavailable. |
+| ML quality / latency / cost benchmarking | The eval harness compares sklearn vs LoRA on accuracy, runtime, and equivalent-cloud USD estimates. |
 | Rebuildable architecture demo | `sample_data/` plus bundled reference data are sufficient to rebuild the entire demo locally with no external services required. |
 
 ## Overview
@@ -103,12 +105,60 @@ Expected result:
 - the bronze -> silver -> gold pipeline runs inside the container
 - generated artifacts are written to `bronze/`, `silver/`, and `gold/`
 - the retained gold mart is rebuilt in `gold/owner_infrastructure_exposure_snapshot.parquet`
+- `gold/publish_report.json` is written with row counts, publish mode, and sink summary
 
 To run tests in the same container image:
 
 ```bash
 docker compose run --rm lakehouse pytest tests/
 ```
+
+## Safe Analytics Publication
+
+Every pipeline run emits a `publish_report.json` artifact with:
+
+- `run_id` — unique identifier for the run
+- `publish_mode` — `commit` or `dry_run`
+- `status` — `success` or `failed`
+- `tables_attempted` — the three ClickHouse sink tables
+- `row_counts` — per-layer row counts
+- `rollback_status` — `not_applicable` | `clean` | `rolled_back` | `partial_rollback_failed`
+- `sink_target` — ClickHouse status, tables refreshed, batch id, and schema validation results
+- `public_safety` — scan result and any findings
+- `artifacts_written` — list of gold artefacts written (parquet + DuckDB paths; empty in `dry_run`)
+
+### `publish_mode=dry_run`
+
+Validates the full pipeline and ClickHouse sink schemas. Writes only `publish_report.json` (and creates its parent directory if it does not already exist) — no other pipeline disk writes (no parquet, no DuckDB, no ClickHouse mutations).
+Useful for CI preflight, demo review, and pre-publish checks.
+
+```bash
+python scripts/run_pipeline.py --publish-mode dry_run
+```
+
+```bash
+python scripts/run_demo.py --publish-mode dry_run
+```
+
+> **Airflow:** when triggered via the Airflow DAG, `dry_run` additionally causes the `run_dbt` task to return early (no dbt execution)
+> because dbt requires gold artefacts that `dry_run` does not produce.
+> The `run_public_safety_scan` task still runs.  See [`airflow/README.md`](airflow/README.md) for details.
+
+### `publish_mode=commit` (default)
+
+Full pipeline with all disk writes and optional ClickHouse sink. Current behaviour is preserved exactly.
+
+```bash
+python scripts/run_pipeline.py --publish-mode commit
+```
+
+### Custom report path
+
+```bash
+python scripts/run_pipeline.py --publish-mode dry_run --report-path /tmp/preflight_report.json
+```
+
+The default report path is `{repo_root}/gold/publish_report.json`.
 
 ## Local Run
 
@@ -117,6 +167,12 @@ python3 -m pip install -e '.[dev]'
 python3 scripts/run_demo.py
 python3 scripts/verify_public_safety.py
 pytest
+```
+
+To run in dry_run mode (writes only `publish_report.json` and its parent directory; no other pipeline artifacts):
+
+```bash
+python3 scripts/run_demo.py --publish-mode dry_run
 ```
 
 The pipeline writes generated outputs to:
@@ -432,9 +488,12 @@ When credentials are absent the repo still runs normally: a one-time warning is 
 | If you care about... | Start here |
 |---|---|
 | End-to-end pipeline orchestration | `src/entity_data_lakehouse/pipeline.py` and `scripts/run_demo.py` |
+| Safe analytics publication and dry_run | `src/entity_data_lakehouse/pipeline.py` (`run_pipeline` with `publish_mode`) |
+| Publish report schema | `gold/publish_report.json` (written by every run) |
 | Bronze/silver/gold modeling | `src/entity_data_lakehouse/bronze.py`, `silver.py`, `gold.py` |
 | Warehouse semantics and SCD rationale | `docs/data_warehouse.md` |
 | Optional ClickHouse sink behavior | `src/entity_data_lakehouse/clickhouse_sink.py` |
+| ClickHouse dry_run schema validation | `clickhouse_sink.validate_sink_schema()` |
 | Baseline ML plus optional LoRA override | `src/entity_data_lakehouse/ml.py` and `ml_lora.py` |
 | ML benchmark cost model (runtime + USD estimates) | `src/entity_data_lakehouse/benchmark_costs.py` |
 | Hybrid retrieval and API surface | `src/entity_data_lakehouse/search.py` and `api.py` |

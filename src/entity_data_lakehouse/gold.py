@@ -473,10 +473,28 @@ def build_gold_outputs(
     gold_root: Path,
     silver_outputs: dict[str, pd.DataFrame],
     contract_paths: dict[str, Path],
-) -> dict[str, pd.DataFrame]:
-    gold_root.mkdir(parents=True, exist_ok=True)
-    dw_root = gold_root / "dw"
-    dw_root.mkdir(parents=True, exist_ok=True)
+    *,
+    dry_run: bool = False,
+) -> tuple[dict[str, pd.DataFrame], list[str]]:
+    """Build and validate all gold outputs.
+
+    Returns
+    -------
+    outputs : dict[str, pd.DataFrame]
+        In-memory gold frames (always populated, even in dry_run).
+    artifacts_written : list[str]
+        Repo-relative paths of every file actually written to disk during this
+        call, collected incrementally so that a mid-function failure leaves the
+        list accurate up to the point of failure.  Empty in dry_run mode.
+    """
+    artifacts_written: list[str] = []
+
+    if not dry_run:
+        gold_root.mkdir(parents=True, exist_ok=True)
+        dw_root = gold_root / "dw"
+        dw_root.mkdir(parents=True, exist_ok=True)
+    else:
+        dw_root = gold_root / "dw"
 
     entity_comprehensive, entity_current, entity_event_log = _entity_scd4(
         silver_outputs["entity_observations"]
@@ -501,17 +519,38 @@ def build_gold_outputs(
         "ownership_current": ownership_current,
     }
 
-    for name, frame in outputs.items():
-        validate_dataframe(frame, contract_paths[name])
-        frame.to_parquet(dw_root / f"{name}.parquet", index=False)
+    try:
+        for name, frame in outputs.items():
+            validate_dataframe(frame, contract_paths[name])
+            if not dry_run:
+                frame.to_parquet(dw_root / f"{name}.parquet", index=False)
+                artifacts_written.append(f"gold/dw/{name}.parquet")
 
-    owner_mart.to_parquet(gold_root / "owner_infrastructure_exposure_snapshot.parquet", index=False)
+        if not dry_run:
+            owner_mart.to_parquet(
+                gold_root / "owner_infrastructure_exposure_snapshot.parquet", index=False
+            )
+            artifacts_written.append("gold/owner_infrastructure_exposure_snapshot.parquet")
 
-    con = duckdb.connect(str(gold_root / "entity_lakehouse.duckdb"))
-    for name, frame in outputs.items():
-        con.execute(f"CREATE OR REPLACE TABLE dw_{name} AS SELECT * FROM frame")
-    con.execute("CREATE OR REPLACE TABLE mart_owner_infrastructure_exposure_snapshot AS SELECT * FROM owner_mart")
-    con.close()
+            # Record the .duckdb artifact immediately after connect() — the file
+            # is created on disk by duckdb.connect() itself, so any subsequent
+            # SQL failure must still report it as written.
+            con = duckdb.connect(str(gold_root / "entity_lakehouse.duckdb"))
+            artifacts_written.append("gold/entity_lakehouse.duckdb")
+            try:
+                for name, frame in outputs.items():
+                    con.execute(f"CREATE OR REPLACE TABLE dw_{name} AS SELECT * FROM frame")
+                con.execute(
+                    "CREATE OR REPLACE TABLE mart_owner_infrastructure_exposure_snapshot "
+                    "AS SELECT * FROM owner_mart"
+                )
+            finally:
+                con.close()
+    except Exception as exc:
+        # Attach whatever was written so far so callers can surface partial
+        # artifact lists in failure reports even when this function raises.
+        exc.__gold_artifacts__ = list(artifacts_written)  # type: ignore[attr-defined]
+        raise
 
     outputs["owner_infrastructure_exposure_snapshot"] = owner_mart
-    return outputs
+    return outputs, artifacts_written

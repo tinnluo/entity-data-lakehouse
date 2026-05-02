@@ -62,10 +62,23 @@ Requires the [clickhouse] optional dependency group::
 
     pip install -e '.[clickhouse]'
 
+Public API
+----------
+- ``write_gold_to_clickhouse(gold_outputs, ml_outputs)`` — full sink with
+  atomic refresh and rollback.  Returns a sink summary dict.
+- ``validate_sink_schema(gold_outputs, ml_outputs)`` — schema-only validation
+  without connecting to ClickHouse.  Safe for ``dry_run`` mode.
+
 Usage (from pipeline.py)::
 
-    from entity_data_lakehouse.clickhouse_sink import write_gold_to_clickhouse
-    write_gold_to_clickhouse(gold_outputs, ml_outputs)
+    from entity_data_lakehouse.clickhouse_sink import (
+        validate_sink_schema,
+        write_gold_to_clickhouse,
+    )
+    # dry_run: validate only
+    schema_results = validate_sink_schema(gold_outputs, ml_outputs)
+    # commit: full atomic refresh
+    sink_summary = write_gold_to_clickhouse(gold_outputs, ml_outputs)
 """
 
 from __future__ import annotations
@@ -235,10 +248,74 @@ def _dtype_matches_clickhouse(ch_type: str, series: "pd.Series") -> bool:
 # ---------------------------------------------------------------------------
 
 
+def validate_sink_schema(
+    gold_outputs: dict[str, "pd.DataFrame"],
+    ml_outputs: dict[str, "pd.DataFrame"],
+) -> list[dict]:
+    """Validate DataFrame schemas against the ClickHouse DDL contracts.
+
+    Checks column-set match and dtype compatibility for all three sink tables
+    without connecting to ClickHouse or mutating any state.  Safe to call in
+    ``dry_run`` mode.
+
+    Parameters
+    ----------
+    gold_outputs:
+        Dict of DataFrames produced by ``build_gold_outputs`` (gold layer).
+    ml_outputs:
+        Dict of DataFrames produced by ``build_ml_predictions`` (ML layer).
+
+    Returns
+    -------
+    list[dict]
+        One entry per sink table::
+
+            [
+                {"table": "ownership_current", "status": "passed", "error": None},
+                {"table": "owner_infrastructure_exposure_snapshot", "status": "failed",
+                 "error": "ClickHouse sink schema mismatch ..."},
+                ...
+            ]
+
+        All three tables are always evaluated; a failure in one does not short-
+        circuit the others.
+    """
+    all_frames = {"gold_outputs": gold_outputs, "ml_outputs": ml_outputs}
+    results: list[dict] = []
+
+    # Use a deterministic placeholder run_id for schema-only validation so
+    # _prepare_insert_frame can stamp batch_id without actually connecting.
+    placeholder_run_id = "dryrun000000"
+
+    for table_name, (dict_name, key) in _TABLE_SOURCES.items():
+        df = all_frames[dict_name].get(key)
+        if df is None:
+            results.append({
+                "table": table_name,
+                "status": "failed",
+                "error": (
+                    f"ClickHouse sink expected key '{key}' in {dict_name}, "
+                    "but it was missing."
+                ),
+            })
+            continue
+        try:
+            df_stamped = df.copy()
+            df_stamped["batch_id"] = placeholder_run_id
+            _prepare_insert_frame(table_name, df_stamped)
+            results.append({"table": table_name, "status": "passed", "error": None})
+        except ValueError as exc:
+            # Expected: schema/dtype contract violation — record as a validation failure.
+            results.append({"table": table_name, "status": "failed", "error": str(exc)})
+        # Any other exception (e.g. programming error) propagates unconditionally.
+
+    return results
+
+
 def write_gold_to_clickhouse(
     gold_outputs: dict[str, "pd.DataFrame"],
     ml_outputs: dict[str, "pd.DataFrame"],
-) -> None:
+) -> dict:
     """Load gold analytics tables into ClickHouse using atomic staging-table swap.
 
     No-ops immediately when ``USE_CLICKHOUSE`` is not ``"true"``.
@@ -269,6 +346,18 @@ def write_gold_to_clickhouse(
     ml_outputs:
         Dict of DataFrames produced by ``build_ml_predictions`` (ML layer).
 
+    Returns
+    -------
+    dict
+        Sink execution summary with the following keys:
+
+        - ``tables_refreshed`` (list[str]): live table names successfully swapped.
+        - ``batch_id`` (str | None): ``run_id`` published to ``lakehouse_batch_log``,
+          or ``None`` when ClickHouse is disabled or an error occurred before publish.
+        - ``status`` (str): ``"skipped"`` | ``"success"`` | ``"failed"``.
+        - ``rollback_status`` (str): ``"not_applicable"`` | ``"clean"`` |
+          ``"rolled_back"`` | ``"partial_rollback_failed"``.
+
     Raises
     ------
     RuntimeError
@@ -282,7 +371,12 @@ def write_gold_to_clickhouse(
     """
     flag = os.environ.get("USE_CLICKHOUSE", "false").strip().lower()
     if flag != "true":
-        return
+        return {
+            "tables_refreshed": [],
+            "batch_id": None,
+            "status": "skipped",
+            "rollback_status": "not_applicable",
+        }
 
     cfg = _get_config()
     run_id = uuid.uuid4().hex[:12]
@@ -328,6 +422,7 @@ def write_gold_to_clickhouse(
     except Exception:
         # Roll back: re-exchange each successfully-swapped table back to the
         # previous live data so the last-known-good snapshot is restored.
+        rollback_failed = False
         for live_table, (db, ex_live) in zip(
             refreshed_tables, ex_live_tables[: len(refreshed_tables)]
         ):
@@ -339,6 +434,7 @@ def write_gold_to_clickhouse(
                     live_table,
                 )
             except Exception as rb_exc:
+                rollback_failed = True
                 logger.error(
                     "Rollback of %s.%s failed: %s — manual recovery may be needed.",
                     db,
@@ -352,7 +448,21 @@ def write_gold_to_clickhouse(
                 client.command(f"DROP TABLE IF EXISTS {db}.{ex_live}")
             except Exception:
                 pass
-        raise
+        rollback_status = "partial_rollback_failed" if rollback_failed else "rolled_back"
+        # Attach structured summary to the exception so pipeline.py can read it
+        # via exc.__sink_summary__, then re-raise so callers still see the
+        # original exception type.
+        _sink_summary = {
+            "tables_refreshed": list(refreshed_tables),
+            "batch_id": None,
+            "status": "failed",
+            "rollback_status": rollback_status,
+        }
+        try:
+            raise
+        except Exception as _exc:
+            _exc.__sink_summary__ = _sink_summary  # type: ignore[attr-defined]
+            raise
 
     # Success path: drop the displaced ex-live tables now that the batch is published.
     for db, ex_live in ex_live_tables:
@@ -362,6 +472,12 @@ def write_gold_to_clickhouse(
             logger.warning("Could not drop ex-live staging table %s.%s; ignoring.", db, ex_live)
 
     logger.info("ClickHouse sink complete (run_id=%s).", run_id)
+    return {
+        "tables_refreshed": list(_TABLE_SOURCES.keys()),
+        "batch_id": run_id,
+        "status": "success",
+        "rollback_status": "clean",
+    }
 
 
 # ---------------------------------------------------------------------------
