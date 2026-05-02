@@ -10,7 +10,6 @@ CI environments regardless of whether apache-airflow is installed.
 from __future__ import annotations
 
 import importlib.util
-import os
 from pathlib import Path
 
 import pytest
@@ -123,7 +122,7 @@ def test_run_dbt_or_skip_calls_dbt_in_commit(monkeypatch) -> None:
     """_run_dbt_or_skip() must call dbt run and dbt test in commit mode."""
     monkeypatch.setenv("PUBLISH_MODE", "commit")
     module = _load_dag_module()
-    from unittest.mock import patch, call
+    from unittest.mock import patch
     with patch.object(module.Variable, "get", return_value=None), \
          patch("subprocess.run") as mock_run:
         module._run_dbt_or_skip()

@@ -629,7 +629,6 @@ class TestArtifactsWrittenOnDuckDBFailure:
         report must still list all artifacts already written by build_gold_outputs(),
         including gold parquets AND entity_lakehouse.duckdb (which gold.py writes
         unconditionally before returning)."""
-        from unittest.mock import patch
         import duckdb as duckdb_mod
 
         repo_root = Path(__file__).resolve().parents[2]
@@ -716,7 +715,6 @@ class TestArtifactsWrittenOnPartialGoldFailure:
         """If duckdb.connect() raises inside build_gold_outputs() (gold.py), the
         failure report must list the parquets that were already written and must
         NOT list entity_lakehouse.duckdb (which had not been written yet)."""
-        from unittest.mock import patch
         import entity_data_lakehouse.gold as gold_mod
 
         repo_root = Path(__file__).resolve().parents[2]
@@ -771,7 +769,7 @@ class TestGoldDuckDBConnectionCleanup:
     def test_connection_closed_when_execute_raises_after_connect(self, tmp_path) -> None:
         """If con.execute() raises after a successful duckdb.connect(), con.close()
         must still be called so the file handle is released."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         import entity_data_lakehouse.gold as gold_mod
         from entity_data_lakehouse.silver import build_silver_outputs
 
@@ -872,7 +870,7 @@ class TestPipelineMLRegistrationConnectionCleanup:
     ) -> None:
         """If the ML-registration con.execute() raises, con.close() must still
         be called."""
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import MagicMock
         import entity_data_lakehouse.pipeline as pipeline_mod
 
         repo_root = Path(__file__).resolve().parents[2]
